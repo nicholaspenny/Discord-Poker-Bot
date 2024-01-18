@@ -9,7 +9,7 @@ def run_discord_bot():
     intents = discord.Intents.default()
     intents.message_content = True
     client = discord.Client(intents=intents)
-    bott = commands.Bot(command_prefix='$', intents=intents)
+    #bott = commands.Bot(command_prefix='$', intents=intents)
 
     @client.event
     async def on_ready():
