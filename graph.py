@@ -191,7 +191,7 @@ def update_name(dictionaries):
     players_database = {
         'Nick': ['UuOZVaVHBL', 'WIu0Z3l0r9', 'gseR2k-QyO'],
         'Dante': ['WE0IAE3QII', '8Jdc1XjMBj'],
-        'Shreyas': ['cKD9AvkfLo', '5vhVDDut10'],
+        'Shreyas': ['cKD9AvkfLo', '5vhVDDut10', '7KwQjlJ3M2'],
         'Nabil': ['8uCU-T89qK'],
         'Stefan': ['DyToyiPUwq', 'ikJq95sN1t', 'v7StLFeZTU'],
         'Austin': ['s-OfUZcUtY'],
@@ -199,7 +199,7 @@ def update_name(dictionaries):
         'Christian': ['EjHsc0yLfZ'],
         'Lila': [],
         'Rohun': ['Tz3ys1wh8S'],
-        'Andy': ['xibJ1QP4fl'],
+        'Andy': ['xibJ1QP4fl', 'NEAj4LE_7s'],
         'Anurag': ['uY2gNzm7vS'],
         'Slater': ['LTOQs2xY6L'],
         'KevinL': [],
