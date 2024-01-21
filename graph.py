@@ -184,7 +184,7 @@ def graph(full_log_path, ledger_path):
     plt.xlabel("Hand number")
     plt.ylabel("Stack Size $")
     plt.legend()
-    plt.savefig('stacks.png')
+    #plt.savefig('stacks.png')
 
 
 def update_name(dictionaries):
