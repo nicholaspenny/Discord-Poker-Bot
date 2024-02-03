@@ -2,14 +2,15 @@ import discord
 import os
 import graph
 import asyncio
-
+from connect import connect, disconnect, query
+import pandas as pd
 from discord.ext import commands
+
 
 def run_discord_bot():
     intents = discord.Intents.default()
     intents.message_content = True
     client = discord.Client(intents=intents)
-    #bott = commands.Bot(command_prefix='$', intents=intents)
 
     @client.event
     async def on_ready():
@@ -20,13 +21,15 @@ def run_discord_bot():
         # Active Servers
         server_id = 1126305350736424980
 
-        ## used channels
+        # used channels
         game = 1126317888991678516
         # game_channel = client.get_channel(game)
         email = 1129582722067726346
         # email_channel = client.get_channel(email)
         email_database = 1129583460223295630
         # email_database_channel = client.get_channel(email_database)
+        database_channel_id = 1199552447279018074
+        # database_channel = client.get_channel(database_channel_id)
         ledgers = 1126305351243944069
         #ledgers_channel = client.get_channel(ledgers)
         graph_test = 1130374032353665024
@@ -36,7 +39,6 @@ def run_discord_bot():
         server_check = 1186201448502009896
         #server_check_channel = client.get_channel(server_check)
 
-        game_link_header = f'https://discord.com/channels/{server_id}/{game}/'
         # guild = client.get_guild(server_id) // must get guild to access role objects
 
         # role ids
@@ -61,7 +63,7 @@ def run_discord_bot():
                 if name == f'<@{message.author.id}>':
                     await entry.delete()
 
-            # add new email to email-database
+            # add new email to email_database
             await email_database_channel.send(f'<@{message.author.id}> {message.content}')
             return
 
@@ -75,6 +77,22 @@ def run_discord_bot():
                 if message.content.startswith('!'):
                     await message.channel.send(message.content)
 
+                return
+
+        elif message.channel.id == database_channel_id:
+            if message.author == client.user:
+                return
+            else:
+                #change to have preset queries and user inputed values
+                if message.content.strip().startswith('!') and message.content.strip().endswith(';'):
+                    connection = connect()
+                    ans, columns = query(connection, message.content.strip()[1:])
+                    answer = pd.DataFrame(ans, columns=columns)
+                    answer.index += 1
+                    pd.set_option('display.max_rows', 10)
+                    await message.channel.send(f"```{answer}```")
+                    pd.reset_option('display.max_rows')
+                    disconnect(connection)
                 return
 
         elif message.channel.id == ledgers:
@@ -91,7 +109,7 @@ def run_discord_bot():
                 else:
                     async for entry in game_channel.history():
                         if entry.content.split()[-1].startswith('https'):
-                            game_link = f"{game_link_header}{entry.id}"
+                            game_link = entry.jump_url
                         break
 
                 await message.channel.send(f'Ledger for: {game_link}')
@@ -107,7 +125,6 @@ def run_discord_bot():
             # prevent loop
             if message.author == client.user:
                 return
-
             error_message = None
 
             # start to generate chart(s) of provided game
@@ -115,11 +132,28 @@ def run_discord_bot():
                 attachment_one = message.attachments[0]
                 attachment_two = message.attachments[1]
 
+                game_channel = client.get_channel(game)
+
+                # gathering #game message of last/given session
+                game_link = 'Cannot find game'
+                game_url = None
+
+                if message.content:
+                    game_link = message.content.split()[0]
+                    game_link_message = await game_channel.fetch_message(game_link.rpartition('/')[2])
+                    game_url = game_link_message.content.split()[-1].rpartition('/')[2]
+                else:
+                    # loop through game to find last game
+                    async for entry in game_channel.history():
+                        if entry.content.split()[-1].startswith('https'):
+                            game_link = entry.jump_url
+                            game_url = entry.content.split()[-1].rpartition('/')[2]
+                            break
                 # using graph.graph_session to check if both are csv and order files
                 # not sure how it would work if provided uncorresponding files
                 # locally created profits.png and stacks.png
                 # returns true if received a log and ledger file (just checking if both csv), false otherwise
-                graph_session = await graph.graph_message(attachment_one, attachment_two)
+                graph_session = await graph.graph_message(attachment_one, attachment_two, game_url)
 
                 if graph_session:
                     game_channel = client.get_channel(game)
@@ -131,17 +165,6 @@ def run_discord_bot():
                         profits_file = discord.File('profits.png')
                         #stacks_file = discord.File('stacks.png')
 
-                        game_link = game_link = 'Cannot find game'
-
-                        if message.content:
-                            game_link = message.content
-                        else:
-                            # loop through game to find last game
-                            async for entry in game_channel.history():
-                                game_link = f"{game_link_header}{entry.id}"
-
-                                if entry.content.split()[-1].startswith('https'):
-                                    break
 
                         # Send images separately for full picture in channel
                         profits_message = await message.channel.send(f'Profits for: {game_link}', file=profits_file)
@@ -182,7 +205,6 @@ def run_discord_bot():
 
                 # send_message(message, user_message, is_private=False,is_link=False)
                 wrong_format_reply = await message.channel.send(f'Just paste a pokernow link in the channel. '
-                f'{game_link_header}{game_instructions}'
                 '\ni.e. <https://www.pokernow.club/games/pg2Hn5EKpaXmJLy3dap0hfp4k>')
                 await message.delete()
                 await asyncio.sleep(5)
@@ -231,5 +253,4 @@ def run_discord_bot():
 
                 return
 
-    #bott.add_command(test)
     client.run(os.getenv('DISCORD_BOT_TOKEN'))
