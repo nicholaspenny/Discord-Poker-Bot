@@ -20,7 +20,11 @@ def query(connection, command, *args):
 
     try:
         cursor = connection.cursor()
-        cursor.execute(command, args)
+        if args:
+            cursor.execute(command, args)
+        else:
+            cursor.execute(command)
+
         value = cursor.fetchall()
         columns = [desc[0] for desc in cursor.description]
         cursor.close()
