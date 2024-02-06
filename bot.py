@@ -33,7 +33,7 @@ def run_discord_bot():
                 d[row[0]] = row[1]
 
         disconnect(connection)
-        print(f'{client.user} is now running from   PC')
+        print(f'{client.user} is now running from EC2')
 
 
     @client.event
@@ -83,7 +83,7 @@ def run_discord_bot():
             if message.author == client.user:
                 return
             else:
-                await message.channel.send('Operating out of PC')
+                await message.channel.send('Operating out of EC2')
 
                 if message.content.startswith('!'):
                     await message.channel.send(message.content)
