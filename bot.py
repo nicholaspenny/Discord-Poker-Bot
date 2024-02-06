@@ -6,7 +6,9 @@ from connect import connect, disconnect, query
 import pandas as pd
 from discord.ext import commands
 
-
+channels = {}
+roles = {}
+misc = {}
 def run_discord_bot():
     intents = discord.Intents.default()
     intents.message_content = True
@@ -14,47 +16,56 @@ def run_discord_bot():
 
     @client.event
     async def on_ready():
-        print(f'{client.user} is now running from PC')
+        global channels
+        global roles
+        global misc
+
+        channels_query = """select channel_name, channel_id from channels;"""
+        roles_query = """select role_name, role_id from roles;"""
+        misc_query = """select misc_name, misc_id from misc;"""
+
+        connection = connect()
+
+        for d, q in [(channels, channels_query), (roles, roles_query), (misc, misc_query)]:
+            result, columns = query(connection, q)
+
+            for row in result:
+                d[row[0]] = row[1]
+
+        disconnect(connection)
+        print(f'{client.user} is now running from   PC')
+
 
     @client.event
     async def on_message(message):
+        global channels
+        global roles
+        global misc
+
         # Active Servers
-        server_id = 1126305350736424980
-
-        # used channels
-        game = 1126317888991678516
-        # game_channel = client.get_channel(game)
-        email = 1129582722067726346
-        # email_channel = client.get_channel(email)
-        email_database = 1129583460223295630
-        # email_database_channel = client.get_channel(email_database)
-        database_channel_id = 1199552447279018074
-        # database_channel = client.get_channel(database_channel_id)
-        ledgers = 1126305351243944069
-        #ledgers_channel = client.get_channel(ledgers)
-        graph_test = 1130374032353665024
-        # graph_test_channel = client.get_channel(graph_test)
-        game_graph = 1185427411219779594
-        # game_graph_channel = client.get_channel(game_graph)
-        server_check = 1186201448502009896
-        #server_check_channel = client.get_channel(server_check)
-
         # guild = client.get_guild(server_id) // must get guild to access role objects
 
+        # used channels
+        # game_channel = client.get_channel(channels['game'])
+        # email_channel = client.get_channel(channels['email'])
+        # email_database_channel = client.get_channel(channels['email_database'])
+        # database_channel = client.get_channel(channels['database'])
+        # ledgers_channel = client.get_channel(channels['ledgers'])
+        # graph_test_channel = client.get_channel(channels['graph_test'])
+        # graph_channel = client.get_channel(channels['game_graph'])
+        # server_check_channel = client.get_channel(channels['server_check'])
+
         # role ids
-        email_needed_role_id = 1129593395925499934
-        # email_needed role = guild.get_role(email_needed_role_id)
-        fiend_role_id = 1130361475270201424
-        # fiend_role = guild.get_role(fiend_role_id)
-        admin_role_id = 1126323029987831879
-        # admin_role = guild.get_role(admin_role_id)
+        # email_needed role = guild.get_role(roles['email_needed'])
+        # fiend_role = guild.get_role(roles['fiend'])
+        # admin_role = guild.get_role(roles['admin'])
 
         username = str(message.author)
         user_message = str(message.content)
         channel = str(message.channel)
 
-        if message.channel.id == email:
-            email_database_channel = client.get_channel(email_database)
+        if message.channel.id == channels['email']:
+            email_database_channel = client.get_channel(channels['email_database'])
 
             # loop through email-database to remove old email if present
             async for entry in email_database_channel.history():
@@ -67,7 +78,7 @@ def run_discord_bot():
             await email_database_channel.send(f'<@{message.author.id}> {message.content}')
             return
 
-        elif message.channel.id == server_check:
+        elif message.channel.id == channels['server_check']:
             # verifying the bot is running and from the correct location
             if message.author == client.user:
                 return
@@ -79,7 +90,7 @@ def run_discord_bot():
 
                 return
 
-        elif message.channel.id == database_channel_id:
+        elif message.channel.id == channels['database']:
             if message.author == client.user:
                 return
             else:
@@ -95,8 +106,8 @@ def run_discord_bot():
                     disconnect(connection)
                 return
 
-        elif message.channel.id == ledgers:
-            game_channel = client.get_channel(game)
+        elif message.channel.id == channels['ledgers']:
+            game_channel = client.get_channel(channels['game'])
 
             if message.author == client.user:
                 return
@@ -121,7 +132,7 @@ def run_discord_bot():
 
                 return
 
-        elif message.channel.id == graph_test or message.channel.id == game_graph:
+        elif message.channel.id == channels['graph_test'] or message.channel.id == channels['graph']:
             # prevent loop
             if message.author == client.user:
                 return
@@ -132,7 +143,7 @@ def run_discord_bot():
                 attachment_one = message.attachments[0]
                 attachment_two = message.attachments[1]
 
-                game_channel = client.get_channel(game)
+                game_channel = client.get_channel(channels['game'])
 
                 # gathering #game message of last/given session
                 game_link = 'Cannot find game'
@@ -156,7 +167,7 @@ def run_discord_bot():
                 graph_session = await graph.graph_message(attachment_one, attachment_two, game_url)
 
                 if graph_session:
-                    game_channel = client.get_channel(game)
+                    # game_channel = client.get_channel(game)
 
                     # if os.path.isfile('profits.png') and os.path.isfile('stacks.png'):
                     if os.path.isfile('profits.png'):
@@ -185,23 +196,23 @@ def run_discord_bot():
             await message.delete()
             return
 
-        elif message.channel.id == email_database:
-            guild = client.get_guild(server_id)
+        elif message.channel.id == channels['email_database']:
+            guild = client.get_guild(misc['server'])
             member_id = user_message.split()[0][2:-1]
-            email_needed = guild.get_role(email_needed_role_id)
+            email_needed = guild.get_role(roles['email_needed'])
             member = await guild.fetch_member(int(member_id))
 
             # remove email needed role
-            await member.remove_roles(email_needed)
+            await member.remove_roles(roles['email_needed'])
             return
 
-        elif message.channel.id == game:
+        elif message.channel.id == channels['game']:
             if message.author == client.user:
                 return
 
             elif not user_message.startswith('https://www.pokernow.club/games/'):
                 # message at the top
-                game_instructions = 1126317978057703484
+                game_instructions = misc['game_instructions']
 
                 # send_message(message, user_message, is_private=False,is_link=False)
                 wrong_format_reply = await message.channel.send(f'Just paste a pokernow link in the channel. '
@@ -212,9 +223,9 @@ def run_discord_bot():
                 return
 
             else:
-                role = f'<@&{fiend_role_id}>'
+                role = f"<@&{roles['fiend']}>"
                 link = user_message.split()[0]
-                email_database_channel = client.get_channel(email_database)
+                email_database_channel = client.get_channel(channels['email_database'])
                 gmail = 'missing'
 
                 async for entry in email_database_channel.history():
