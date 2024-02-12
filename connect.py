@@ -14,10 +14,7 @@ def connect():
     return connection
 
 
-def query(connection, command, *args):
-    value = None
-    columns = None
-
+def query(connection, command: str, *args):
     try:
         cursor = connection.cursor()
         if args:
@@ -38,4 +35,3 @@ def query(connection, command, *args):
 def disconnect(connection):
     if connection is not None:
         connection.close()
-
