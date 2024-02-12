@@ -2,11 +2,12 @@ import csv
 import re
 import sys
 import os
+import discord
 import matplotlib.pyplot as plt
 from connect import connect, disconnect, query
 
 
-async def graph_message(one, two, game_url):
+async def graph_message(one: discord.Attachment, two: discord.Attachment, game_url: str):
     ledger_path = None
     log_path = None
     one_path = one.filename
@@ -33,19 +34,21 @@ async def graph_message(one, two, game_url):
                         break
 
     if ledger_path and log_path:
-        connection = connect()
-        game_id = None
+        with connect() as connection:
+            game_id_value = 0
 
-        g, columns = query(connection, """INSERT INTO games (date, url) VALUES 
-                                           (%s, %s) 
-                                           ON CONFLICT(url) DO NOTHING
-                                           RETURNING game_id;""", timestamp, game_url)
-        if g:
-            game_id = g[0][0]
-            connection.commit()
+            g, columns = query(connection, """INSERT INTO games (date, url) VALUES 
+                                               (%s, %s) 
+                                               ON CONFLICT(url) DO NOTHING
+                                               RETURNING game_id;""", timestamp, game_url)
+            if g:
+                game_id_value = g[0][0]
+                connection.commit()
+
+            connection.rollback()
         disconnect(connection)
 
-        graph(log_path, ledger_path, game_id)
+        graph(log_path, ledger_path, game_id_value)
         os.remove(one_path)
         os.remove(two_path)
         return True
@@ -53,7 +56,7 @@ async def graph_message(one, two, game_url):
         return False
 
 
-def graph(full_log_path, ledger_path, game_id):
+def graph(full_log_path: str, ledger_path: str, game_id_val: int):
     players = {}  # userid: alias
     transactions = {}  # userid: [pot net, stack change, stack change bool, street action]
     stack_sizes = {}  # userid: [stack at start of hand #]
@@ -63,41 +66,38 @@ def graph(full_log_path, ledger_path, game_id):
         csv_reader = csv.reader(csv_file)
         next(csv_reader)
 
-        connection = connect()
+        with connect() as connection:
+            if game_id_val:
+                query(connection, """DELETE FROM ledgers WHERE game_id = %s;""", game_id_val)
 
-        if game_id:
-            query(connection, """DELETE FROM ledgers WHERE game_id = %s;""", game_id)
+            for row in csv_reader:
+                players[row[1]] = row[0]
+                if game_id_val:
+                    query(connection, """INSERT INTO users (user_id, aliases) VALUES
+                                                          (%s, '{}')
+                                                          ON CONFLICT DO NOTHING;""", row[1])
+                    query(connection, """INSERT INTO ledgers (game_id, user_id, net, alias) VALUES 
+                                          (%s, %s, %s, %s)
+                                          ON CONFLICT (game_id, user_id) DO
+                                          UPDATE SET net = ledgers.net + EXCLUDED.net;""",
+                          game_id_val, row[1], row[7], row[0])
 
-        for row in csv_reader:
-            players[row[1]] = row[0]
-            if game_id:
-                print('here', game_id, row[1], row[7], row[0])
-                p, pcolumns = query(connection, """INSERT INTO users (user_id, aliases) VALUES
-                                                      (%s, '{}')
-                                                      ON CONFLICT DO NOTHING;""", row[1])
-                print(p)
-                print('---')
-                q, columns = query(connection, """INSERT INTO ledgers (game_id, user_id, net, alias) VALUES 
-                                      (%s, %s, %s, %s)
-                                      ON CONFLICT (game_id, user_id) DO
-                                      UPDATE SET net = ledgers.net + EXCLUDED.net;""", game_id, row[1], row[7], row[0])
-                print(q)
+            if game_id_val:
+                query(connection, """UPDATE users u 
+                                     SET aliases = (SELECT ARRAY(SELECT DISTINCT l.alias FROM ledgers l
+                                                                 WHERE l.user_id = u.user_id));""")
+                connection.commit()
 
-        if game_id:
-            query(connection, """UPDATE users u 
-                                 SET aliases = (SELECT ARRAY(SELECT DISTINCT l.alias FROM ledgers l
-                                                             WHERE l.user_id = u.user_id));""")
-            connection.commit()
-
+            connection.rollback()
         disconnect(connection)
 
     for player in players.keys():
         # list of stack sizes at the start of each hand [individual hand win/loss, buyin/buyout, ]
-        transactions[player] = [0, 0, 0, 0]
+        transactions[player] = [0.0, 0.0, 0.0, 0.0]
         # list of total net buyin/buyout at the start of each hand
-        buyins[player] = [0]
+        buyins[player] = [0.0]
         # list of stack sizes at the start of each hand
-        stack_sizes[player] = [0]
+        stack_sizes[player] = [0.0]
 
     with open(full_log_path, 'r') as csv_file:
         hand_number = 0
@@ -225,27 +225,30 @@ def graph(full_log_path, ledger_path, game_id):
     # plt.savefig('stacks.png')
 
 
-def update_name(dictionaries, players_dict):
+def update_name(dictionaries: dict, players_dict: dict):
     # searching user_ids within the given dictionary to update it to the players name if they exist in database
     # or replacing it with the alias used during the game if they do not exist in the database
 
     new_dictionaries = {}
-    connection = connect()
-    for player in dictionaries:
-        n, columns = query(connection, """SELECT p.name FROM players p 
-                                          JOIN users u ON
-                                          u.player_id = p.player_id and u.user_id = %s;""", player)
-        if n:
-            name = n[0][0]
-            if new_dictionaries.get(name):
-                new_dictionaries[name] = [sum(x) for x in zip(new_dictionaries[name], dictionaries[player])]
+    with connect() as connection:
+        for player in dictionaries:
+            n, columns = query(connection, """SELECT p.name FROM players p 
+                                              JOIN users u ON
+                                              u.player_id = p.player_id and u.user_id = %s;""", player)
+            if n:
+                name = n[0][0]
+                if new_dictionaries.get(name):
+                    new_dictionaries[name] = [sum(x) for x in zip(new_dictionaries[name], dictionaries[player])]
+                else:
+                    new_dictionaries[name] = dictionaries[player]
             else:
-                new_dictionaries[name] = dictionaries[player]
-        else:
-            new_dictionaries[players_dict[player]] = dictionaries[player]
+                new_dictionaries[players_dict[player]] = dictionaries[player]
+
+            connection.rollback()
     disconnect(connection)
+
     return new_dictionaries
 
 
 if __name__ == '__main__':
-    graph_message(sys.argv[1], sys.argv[2], sys.argv[3])
+    graph(sys.argv[1], sys.argv[2], 1)
