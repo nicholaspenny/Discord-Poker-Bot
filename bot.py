@@ -45,9 +45,9 @@ def run_discord_bot():
 
         print(f'{client.user} is now running from PC')
 
-        await timed_msg()
+        await monthly_purge()
 
-    async def timed_msg():
+    async def monthly_purge():
         global misc
         global misc_query
         global players
