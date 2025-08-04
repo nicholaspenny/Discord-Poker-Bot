@@ -23,7 +23,7 @@ def main():
     setup_logging()
 
     logger = logging.getLogger(__name__)
-    logger.info("Launching FiendBot")
+    logger.info("Launching Discord Poker Bot")
 
     bot.run_discord_bot()
 
