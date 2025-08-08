@@ -1,6 +1,8 @@
-import psycopg2
-from config import config
 import logging
+
+import psycopg2
+
+from src.config import config
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +21,7 @@ def connect():
 def query(connection, command: str, *args):
     try:
         cursor = connection.cursor()
-        if args:
-            cursor.execute(command, args)
-        else:
-            cursor.execute(command)
+        cursor.execute(command, args)
 
         if cursor.description is not None:
             value = cursor.fetchall()
