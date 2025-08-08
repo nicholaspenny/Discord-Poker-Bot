@@ -5,6 +5,7 @@ import threading
 import time
 from typing import Optional
 
+from dotenv import load_dotenv
 import google.generativeai as genai
 import pandas as pd
 from PIL import Image
@@ -12,9 +13,13 @@ from rapidfuzz import fuzz, process
 
 from src.connect import connect, disconnect, query
 
+load_dotenv()
+
 logger = logging.getLogger(__name__)
-done = False
+
 ERROR_CODE = 'Error-0001'
+
+done = False
 
 def gemini(images: list[Image.Image], game_id=None) -> tuple[pd.DataFrame, Optional[bool]]:
     global ERROR_CODE
