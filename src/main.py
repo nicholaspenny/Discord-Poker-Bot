@@ -1,7 +1,8 @@
-import bot
 import logging
-import os
 from logging.handlers import RotatingFileHandler
+import os
+
+from src import bot
 
 os.makedirs("./logs", exist_ok=True)
 
@@ -30,3 +31,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
