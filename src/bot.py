@@ -7,6 +7,7 @@ import re
 from typing import Optional
 
 import discord
+from dotenv import load_dotenv
 import pandas as pd
 from PIL import Image
 
@@ -14,6 +15,8 @@ from src.connect import connect, disconnect, query
 from src import graph
 from src import ledger_gemini
 from src import query_presets
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
