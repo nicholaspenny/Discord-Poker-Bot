@@ -11,6 +11,13 @@ from matplotlib.ticker import AutoMinorLocator
 
 from src.connect import connect, disconnect, query
 
+COLORS = [
+    "Blue", "Red", "Lime", "Magenta", "Orange", "SaddleBrown", "Cyan",
+    "DarkViolet", "Gray", "Green", "Gold", "Salmon", 'SkyBlue', 'Orchid',
+]
+
+plt.rcParams['axes.prop_cycle'] = plt.cycler(color=COLORS)
+
 logger = logging.getLogger(__name__)
 
 
@@ -148,14 +155,8 @@ def graph(log: list[list[str]], ledger: list[list[str]]) -> io.BytesIO:
         nets[player] = [x1 - x2 for (x1, x2) in zip(stack_sizes[player], buy_ins[player])]
 
     # Graphing with matplotlib
-    plt.figure(figsize=(10, 6), dpi=450)
-    colors = [
-        "Blue", "Red", "Lime", "Magenta", "Orange", "SaddleBrown", "Cyan",
-        "DarkViolet", "Gray", "Green", "Gold", "Salmon", 'SkyBlue', 'Orchid',
-    ]
-    plt.rcParams['axes.prop_cycle'] = plt.cycler(color=colors)
-    ax = plt.gca()
-    for user, values in net.items():
+    fig, ax = plt.subplots(figsize=(10, 6), dpi=450)
+    for user, values in nets.items():
         numeric_values = values
         ax.plot(numeric_values, label=user)
 
@@ -175,9 +176,9 @@ def graph(log: list[list[str]], ledger: list[list[str]]) -> io.BytesIO:
     ax.yaxis.set_minor_locator(AutoMinorLocator(4))
     ax.grid(True, linestyle='-', color='gray', alpha=0.5)
     ax.grid(True, which='minor', linestyle=':', linewidth=0.5, color='gray', alpha=0.6)
-    plt.tight_layout()
+    fig.tight_layout()
     buffer = io.BytesIO()
-    plt.savefig(buffer, format='png')
+    fig.savefig(buffer, format='png')
     buffer.seek(0)
     return buffer
 
