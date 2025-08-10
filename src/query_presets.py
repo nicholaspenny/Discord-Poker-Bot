@@ -18,28 +18,30 @@ def players():
 
 
 def leaderboard(names = None, order_avg=False):
+    leaderboard_query_mid = ''
+    params = []
+    if names:
+        leaderboard_query_mid = """
+            WHERE p.name ILIKE ANY(%s)
+            """
+        params.append(names)
+    leaderboard_query_end = f"""
+        ORDER BY {'avg_net_per_appearance' if order_avg else 'total_net'} desc;
+        """
+    leaderboard_query = f"""
+        SELECT u.player_id, 
+            p.name,
+            COUNT(*) AS appearances,
+            round(SUM(l.net/100.0),2) AS total_net,
+            ROUND(AVG(l.net/100.0), 2) AS avg_net_per_appearance
+        FROM ledgers l
+        JOIN users u ON l.user_id = u.user_id
+        JOIN players p ON u.player_id = p.player_id{leaderboard_query_mid}
+        GROUP BY u.player_id, p.name
+        {leaderboard_query_end}
+        """
     with connect() as connection:
-        query_start = f"""
-            SELECT u.player_id, 
-                p.name,
-                COUNT(*) AS appearances,
-                round(SUM(l.net/100.0),2) AS total_net,
-                ROUND(AVG(l.net/100.0), 2) AS avg_net_per_appearance
-            FROM ledgers l
-            JOIN users u ON l.user_id = u.user_id
-            JOIN players p ON u.player_id = p.player_id
-            """
-        query_middle = '\n'
-        params = []
-        if names:
-            query_middle = '\nWHERE p.name ILIKE ANY(%s)'
-            params.append(names)
-        query_end = f"""
-            GROUP BY u.player_id, p.name
-            ORDER BY {'avg_net_per_appearance' if order_avg else 'total_net'} desc;
-            """
-
-        a, c = query(connection, query_start + query_middle + query_end, params)
+        a, c = query(connection, leaderboard_query, params)
     disconnect(connection)
     return a, c
 
@@ -48,7 +50,7 @@ def career(name = None):
     career_query = """
         SELECT ledgers.alias,
             ROUND(ledgers.net / 100.0, 2) AS net,
-            ROUND(SUM(ledgers.net / 100.0) OVER (ORDER BY games.date), 2) as YTD,
+            ROUND(SUM(ledgers.net / 100.0) OVER (ORDER BY games.date), 2) as career,
             TO_CHAR(games.date, 'YYYY-MM-DD') as date
         FROM ledgers
         JOIN users ON users.user_id = ledgers.user_id
@@ -57,7 +59,6 @@ def career(name = None):
         WHERE players.name ILIKE %s
         ORDER BY games.date;
         """
-
     if name:
         with connect() as connection:
             a, c = query(connection, career_query,f'%{name}%')
@@ -67,64 +68,85 @@ def career(name = None):
         return [], None
 
 
-
-def ytd(selected_players = None) -> io.BytesIO:
-    ytd_query = """
-        SELECT players.name AS name,
-            ledgers.net / 100.0 AS net,
-            games.date AS date,
-            ledgers.game_id AS game_id
-        FROM ledgers
-        JOIN users ON users.user_id = ledgers.user_id
-        JOIN players ON players.player_id = users.player_id
-        JOIN games ON ledgers.game_id = games.game_id
-        ORDER BY players.name, games.date;
-        """
-
-    with connect() as connection:
-        df = pd.read_sql(ytd_query, connection)
-    disconnect(connection)
-
-    df['date'] = pd.to_datetime(df['date'], utc=True).dt.tz_localize(None)
-    df['date'] = df['date'].dt.floor('D')
-
+def career_graph(selected_players = None) -> io.BytesIO:
+    params = []
+    graph_query_mid = ''
     if selected_players:
-        df = df[df['name'].str.lower().isin([name.lower() for name in selected_players])]
-    df = df.sort_values(['name', 'date', 'game_id'])
-    df['YTD'] = df.groupby('name')['net'].cumsum()
+        graph_query_mid = f"""WHERE name ILIKE ANY (%s)"""
+        params.append(selected_players)
+    graph_query_end = """ORDER BY name, game_id;"""
+    graph_query = f"""
+        WITH per_game AS (
+            SELECT p.name AS name,
+                g.game_id AS game_id,
+                g.date AS date,
+                SUM(l.net) / 100.0 AS ytd
+            FROM games g
+            JOIN ledgers l ON g.game_id = l.game_id
+            JOIN users u ON l.user_id = u.user_id
+            JOIN players p ON u.player_id = p.player_id
+            GROUP BY p.name, g.game_id, g.date
+            )
+        SELECT name,
+            game_id,
+            date,
+            ROUND(SUM(ytd) OVER (
+                PARTITION BY name
+                ORDER BY game_id
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ), 2) AS career
+        FROM per_game
+        {graph_query_mid}
+        {graph_query_end}
+        """
+    games_query = "SELECT game_id, date FROM games ORDER BY game_id"
+    with connect() as connection:
+        ans, columns = query(connection, graph_query, params)
+        df = pd.DataFrame(ans, columns=columns)
+        ans2, columns2 = query(connection, games_query)
+        date_map = pd.DataFrame(ans2, columns=columns2).set_index("game_id")["date"]
+    disconnect(connection)
+    wide = df.pivot(index="game_id", columns="name", values="career")
+    wide = wide.ffill()
+    wide = wide.reindex(range(wide.index.min(), wide.index.max() + 1)).ffill()
 
-    df = df.sort_values(['name', 'game_id'])
+    num_lines = len(wide.columns)
+    MAX_PLAYERS_PER_COL = 20
+    num_cols = (num_lines + MAX_PLAYERS_PER_COL - 1) // MAX_PLAYERS_PER_COL
 
-    fig, ax = plt.subplots(figsize=(12, 9))
+    fig, ax = plt.subplots(figsize=(11+num_cols*1.5, 8))
+    for player in wide.columns:
+        ax.plot(wide.index, wide[player], label=player)
 
-    min_game = df['game_id'].min()
-    max_game = df['game_id'].max()
-    xticks = list(range(min_game, max_game, 10))
-    ax.set_xlim(min_game, max_game + 5)
+    game_ids = wide.index.to_list()
+    MAX_TICKS = 10
+    step = max(1, len(game_ids) // MAX_TICKS)
+    tick_positions = game_ids[::step] + [game_ids[-1]]
+    tick_positions = sorted(set(tick_positions))
 
-    for name, group in df.groupby('name'):
-        group = group.sort_values('game_id')
-        x = group['game_id'].tolist()
-        y = group['YTD'].tolist()
-
-        ax.plot(x, y, label=name)
-
-    xtick_labels = []
-    for x in xticks:
-        closest_row = df.iloc[(df['game_id'] - x).abs().argsort().iloc[0]]
-        xtick_labels.append(closest_row['date'].strftime('%b %Y'))
-
-    ax.set_xticks(xticks)
-    ax.set_xticklabels(xtick_labels, rotation=45)
-
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(
+        [date_map.get(gid).strftime("%Y-%m-%d") if date_map.get(gid) else "" for gid in tick_positions], rotation=90
+    )
     ax.grid(True, axis='x', which='major', linestyle='--')
-    ax.grid(False, axis='y')
-    ax.axhline(0, color='black', linewidth=1)
-    ax.legend(title='Player', bbox_to_anchor=(1.02, 1), loc='upper left')
+    ax.grid(True, axis='y', which='major', linestyle='--')
+    ax.axhline(0, color='black', linewidth=1, linestyle='--')
 
-    ax.set_xlabel('Date (by game_id)')
-    ax.set_ylabel('YTD')
-    ax.set_title('Player Career Graphs')
+    num_lines = len(wide.columns)
+    num_cols = (num_lines + MAX_PLAYERS_PER_COL - 1) // MAX_PLAYERS_PER_COL
+    legend = ax.legend(title='PLAYERS', ncol=num_cols, fontsize='medium', loc='center left', bbox_to_anchor=(1, .5))
+    legend.get_title().set_fontweight('bold')
+    legend.get_title().set_fontsize('large')
+    legend.get_frame().set_linewidth(1.5)
+    legend.get_frame().set_edgecolor('blue')
+
+    ax.set_xlim(left=wide.index[0], right=wide.index[-1] - 1)
+    ax.set_ylim(bottom=ax.get_ylim()[0], top=ax.get_ylim()[1])
+    ax.axhline(0, color='black', linewidth=0.5, linestyle='--')
+    ax.axhspan(ax.get_ylim()[0], 0, color='red', alpha=0.03, zorder=0)
+    ax.set_xlabel('Date')
+    ax.set_ylabel('Career Net')
+    ax.set_title('Player Careers')
 
     fig.tight_layout()
     buffer = io.BytesIO()
