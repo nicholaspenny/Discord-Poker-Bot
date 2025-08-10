@@ -57,7 +57,7 @@ def populate_dictionaries():
         # This is to default hard-code dictionaries for necessary channels/roles
         roles = {'admin': 1,
                  'email_needed': 2,
-                 'poker bot': 3,
+                 'poker_bot': 3,
                  'star': 4,}
         channels = {'graph': 1,
                     'ledgers': 2,
@@ -173,14 +173,12 @@ async def on_message(message: discord.Message):
                     logger.debug('Starting to Add Games to Database')
                     game_query = """INSERT INTO games (url, date) VALUES (%s, %s);"""
                     links = []
-
                     game_channel = client.get_channel(channels['game'])
                     # finding messages in #game with a pokernow url, oldest to newest
                     async for entry in game_channel.history(after=datetime.datetime(year=y, month=m, day=d)):
                         if POKERNOW in entry.content:
                             words_with_url = [word for word in entry.content.split() if POKERNOW in word]
                             links.append([words_with_url[0], entry.created_at.strftime('%m-%d-%y'), entry.created_at])
-
                     try:
                         with connect() as connection:
                             for item in links:
@@ -197,7 +195,6 @@ async def on_message(message: discord.Message):
                 # message: !add_ledgers {game_id of 1st ledger} MM DD YYYY [MM DD YYY] <-- [optional end date]
                 if len(words) in (5 , 8):
                     logger.debug('Starting to Add Ledgers to Database')
-
                     game_id = int(words[1])
                     m = int(words[2])
                     d = int(words[3])
@@ -208,7 +205,6 @@ async def on_message(message: discord.Message):
                         if len(words) == 8
                         else datetime.datetime.now()
                     )
-
                     i = 0
                     attachments_list = []
                     buffer = None
@@ -250,7 +246,6 @@ async def on_message(message: discord.Message):
                     for file in attachments[1:]:
                         await channel.send(file=await file.to_file())
                 await message.channel.send(f'*Message Sent In: {channel.jump_url}')
-
                 return
             elif message_match:
                 # ! {message_link} [body] <-- [optional body if attachments included]
@@ -321,8 +316,8 @@ async def on_message(message: discord.Message):
                 await message.channel.send("!Include exactly 1 player name. !career name. !players.")
                 return
             elif option == 'graph':
-                ytd_graph = query_presets.ytd(txt.split()[1:])
-                graph_file = discord.File(ytd_graph, filename='ytd_graph.png')
+                career_graph = query_presets.career_graph(txt.split()[1:])
+                graph_file = discord.File(career_graph, filename='career_graph.png')
                 await message.channel.send(file=graph_file)
                 return
             return
