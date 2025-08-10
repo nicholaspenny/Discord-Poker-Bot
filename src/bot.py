@@ -130,7 +130,7 @@ async def game_jump(content: str) -> Optional[discord.Message]:
 @client.event
 async def on_ready():
     populate_dictionaries()
-    logger.info('%s is now running from PC', client.user)
+    logger.info('%s is now running!', client.user)
 
 
 @client.event
