@@ -450,4 +450,4 @@ async def on_message(message: discord.Message):
 
 
 def run_discord_bot():
-    client.run(os.getenv('DISCORD_BOT_TOKEN'))
+    client.run(os.getenv('DISCORD_BOT_TOKEN'), log_handler=None)
