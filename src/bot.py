@@ -74,8 +74,8 @@ async def attachments_to_images(attachments_list: list[list[discord.Attachment]]
     try:
         for sublist in attachments_list:
             row = []
-            for a in sublist:
-                img_bytes = await a.read()
+            for attachment in sublist:
+                img_bytes = await attachment.read()
                 image = Image.open(io.BytesIO(img_bytes))
                 row.append(image)
             images.append(row)
@@ -84,25 +84,6 @@ async def attachments_to_images(attachments_list: list[list[discord.Attachment]]
         images = []
 
     return images
-
-
-async def view_emails(message: discord.Message):
-    email = [word for word in message.content.split() if '@' in word and '<' not in word]
-    ids = [message.author.id]
-    with connect() as connection:
-        if email:
-            ans, columns = query(connection, """Select discord_id
-                                        from players
-                                        where email ilike %s""", email[0])
-            if ans:
-                ids.append(ans[0][0])
-    disconnect(connection)
-    email_db_channel = client.get_channel(channels['email_database'])
-    if email_db_channel.overwrites_for(message.guild.default_role).view_channel is False:
-        for item in ids:
-            if item != client.user.id:
-                await email_db_channel.set_permissions(message.guild.get_member(item), view_channel=True)
-    return
 
 
 async def game_jump(content: str) -> Optional[discord.Message]:
@@ -317,8 +298,21 @@ async def on_message(message: discord.Message):
                 return
             elif option == 'graph':
                 career_graph = query_presets.career_graph(txt.split()[1:])
-                graph_file = discord.File(career_graph, filename='career_graph.png')
-                await message.channel.send(file=graph_file)
+                if career_graph:
+                    graph_file = discord.File(career_graph, filename='career_graph.png')
+                    await message.channel.send(file=graph_file)
+                else:
+                    await message.channel.send('Error or No Career Graph')
+                return
+            elif option == 'recent':
+                days = 30
+                if txt.split()[1:]: days = txt.split()[1]
+                recent_graph = query_presets.recent_graph(days)
+                if recent_graph:
+                    recent_file = discord.File(recent_graph, filename='recent_graph.png')
+                    await message.channel.send(file=recent_file)
+                else:
+                    await message.channel.send(f'No games in the last {days} days')
                 return
             return
         return
@@ -338,11 +332,8 @@ async def on_message(message: discord.Message):
         await message.delete()
 
         if game_jump_message:
-            await view_emails(game_jump_message)
-
             words_with_url = [word for word in game_jump_message.content.split() if POKERNOW in word]
             url = words_with_url[0].rpartition('/')[2]
-
             game_query = """INSERT INTO games (url, date) VALUES (%s, %s)
                             ON CONFLICT (url) DO NOTHING RETURNING game_id;"""
             try:
@@ -436,7 +427,7 @@ async def on_message(message: discord.Message):
         # newest to oldest
         async for entry in email_database_channel.history():
             if message.author in entry.mentions:
-                if email := [word for word in message.content.split() if '@' in word and '<' not in word]:
+                if email := [word for word in entry.content.split() if '@' in word and '<' not in word]:
                     bot_link = await message.channel.send(f'{ping} {email[0]} \n{link}')
                     await bot_link.create_thread(name="Notes", auto_archive_duration=1440)
                     await message.delete()

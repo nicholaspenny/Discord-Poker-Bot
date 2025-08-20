@@ -160,7 +160,7 @@ def graph(log: list[list[str]], ledger: list[list[str]]) -> io.BytesIO:
         numeric_values = values
         ax.plot(numeric_values, label=user)
 
-    ax.set_xlabel("Hand number")
+    ax.set_xlabel("Hand #")
     ax.set_ylabel("Net $")
     legend = ax.legend(title='PLAYERS', bbox_to_anchor=(1, 0.5), loc='center left', frameon=True)
     legend.get_title().set_fontweight('bold')
@@ -168,14 +168,15 @@ def graph(log: list[list[str]], ledger: list[list[str]]) -> io.BytesIO:
     legend.get_frame().set_linewidth(1.5)
     legend.get_frame().set_edgecolor('blue')
 
+    ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+    ax.yaxis.set_minor_locator(AutoMinorLocator(5))
     ax.set_xlim(left=0)
     ax.set_ylim(bottom=ax.get_ylim()[0], top=ax.get_ylim()[1])
     ax.axhline(0, color='black', linewidth=0.5, linestyle='--')
     ax.axhspan(ax.get_ylim()[0], 0, color='red', alpha=0.03, zorder=0)
-    ax.xaxis.set_minor_locator(AutoMinorLocator(5))
-    ax.yaxis.set_minor_locator(AutoMinorLocator(4))
     ax.grid(True, linestyle='-', color='gray', alpha=0.5)
     ax.grid(True, which='minor', linestyle=':', linewidth=0.5, color='gray', alpha=0.6)
+
     fig.tight_layout()
     buffer = io.BytesIO()
     fig.savefig(buffer, format='png')

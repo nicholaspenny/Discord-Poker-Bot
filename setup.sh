@@ -1,5 +1,7 @@
 #!/bin/bash
 
+cd "$(dirname "$0")"
+
 echo "Creating virtual environment..."
 python3 -m venv venv
 
