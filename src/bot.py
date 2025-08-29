@@ -46,7 +46,7 @@ CHANNELS_TEMPLATE = [
     'admin', 'commands', 'email', 'email-database', 'game', 'game-test', 'graph',
     'graph-test', 'ledgers', 'ledgers-test', 'manage', 'music', 'query', 'query-test', 'roles'
 ]
-ROLES_TEMPLATE = ['fiend', 'admin', 'fiend bot', 'email needed']
+ROLES_TEMPLATE = ['star', 'admin', 'poker bot', 'email needed']
 
 
 async def populate_dictionaries():
@@ -63,9 +63,9 @@ async def populate_dictionaries():
         logger.warning('Using Default Dictionary Values: %s', err)
         # This is to default hard-code dictionaries in primary server for necessary channels/roles
         roles = {1:
-                     {'fiend': 1,
+                     {'star': 1,
                       'admin': 2,
-                      'fiend bot': 3,
+                      'poker bot': 3,
                       'email needed': 4,
                       }
                  }
@@ -203,7 +203,7 @@ async def on_ready():
         if admin_id is not None:
             channel = client.get_channel(admin_id)
             if channel:
-                await channel.send('FiendBot Online! At Your Service!')
+                await channel.send('Poker Bot Online! At Your Service!')
 
 
 def update_guild_channel(
@@ -269,7 +269,7 @@ async def on_guild_role_delete(role: discord.Role):
 async def on_guild_join(guild: discord.Guild):
     await populate_dictionaries()
     logger.info('%s Just Joined %s', client.user, guild.name)
-    await client.get_channel(channels[guild.id]['admin']).send('FiendBot Online! At Your Service!')
+    await client.get_channel(channels[guild.id]['admin']).send('Poker Bot Online! At Your Service!')
 
 
 @client.event
@@ -623,7 +623,7 @@ async def on_message(message: discord.Message):
             return
         elif not POKERNOW in message.content:
             return
-        ping = f"<@&{roles[guild.id]['fiend']}>"
+        ping = f"<@&{roles[guild.id]['star']}>"
         link = [word for word in message.content.split() if POKERNOW in word][0]
         email_database_channel = client.get_channel(channels[guild.id]['email-database'])
         email = None
@@ -638,7 +638,7 @@ async def on_message(message: discord.Message):
                 break
         missing_email = f"Lobby creator must first register an email with the server." \
                         f"\nAdd one to <#{channels[guild.id]['email']}> " \
-                        "or contact an <@&{roles[guild.id]['admin']}> for access."
+                        f"or contact an <@&{roles[guild.id]['admin']}> for access."
         await message.channel.send(missing_email)
         await message.delete()
         return
