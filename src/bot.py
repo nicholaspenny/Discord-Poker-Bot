@@ -362,7 +362,8 @@ async def on_message(message: discord.Message):
                         for index, sublist in enumerate(images_list):
                             results.append(await asyncio.to_thread(ledger_gemini.gemini, sublist, game_id=game_id + index))
                         ledgers_sum = ledger_gemini.insert_ledgers(ledger_gemini.format_ledgers(results), game_id=game_id)
-                        logger.info('%s Ledgers Uploaded', len(images_list))
+                        logger.info('%s Ledgers Inserted', len(images_list))
+                        dump_database()
                         if ledgers_sum:
                             await message.channel.send(f'Unbalanced Ledgers Sum: {ledgers_sum}')
                             logger.warning('Unbalanced Ledgers Sum: %s', ledgers_sum)
@@ -555,6 +556,7 @@ async def on_message(message: discord.Message):
                     results.append(await asyncio.to_thread(ledger_gemini.gemini, sublist, game_id=ans[0][0]))
                 ledgers_sum = ledger_gemini.insert_ledgers(ledger_gemini.format_ledgers(results), game_id=ans[0][0])
                 logger.info('%s Ledger(s) Inserted', len(images_list))
+                dump_database()
                 if ledgers_sum:
                     await message.channel.send(f'Unbalanced Ledgers Sum: {ledgers_sum}')
                     logger.warning('Unbalanced Ledgers Sum: %s', ledgers_sum)
@@ -615,6 +617,7 @@ async def on_message(message: discord.Message):
             with connect() as connection:
                 query(connection, insert_player_query, member_name ,member_id, member_email, member_email, member_id)
             disconnect(connection)
+            dump_database()
         except Exception as err:
             logger.exception('Unable to Update Player Email: %s', err)
         return
