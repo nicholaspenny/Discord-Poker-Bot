@@ -1,11 +1,9 @@
 discord.py==2.3.2
-google-generativeai==0.8.5
+google-genai==1.32.0
 matplotlib==3.8.3
 pandas==2.3.1
-Pillow==11.3.0
 protobuf==5.29.5
 psycopg2==2.9.9
 pytest==8.4.1
 python-dotenv==1.1.1
 rapidfuzz==3.13.0
-

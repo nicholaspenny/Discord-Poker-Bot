@@ -1,16 +1,18 @@
 import asyncio
 import datetime
-import io
 import logging
 import os
 import re
+import signal
+import subprocess
+import sys
 from typing import Optional
 
 import discord
 from dotenv import load_dotenv
 import pandas as pd
-from PIL import Image
 
+from src.config import config
 from src.connect import connect, disconnect, query
 from src import graph
 from src import ledger_gemini
@@ -20,6 +22,13 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+has_dumped = False
+db_conf = config()
+DATABASE_URL = (
+    f"postgresql://{db_conf['user']}:{db_conf['password']}"
+    f"@{db_conf['host']}:{db_conf['port']}/{db_conf['database']}"
+)
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -28,56 +37,75 @@ client = discord.Client(intents=intents)
 POKERNOW = 'https://www.pokernow.club/games/'
 JUMP_URL_PREFIX = 'https://discord.com/channels/'
 
-channels: dict[str, int] = {}
+channels: dict[int: dict[str, int]] = {}
 channel_query = """SELECT channel_name, channel_id FROM channels;"""
-roles: dict[str, int] = {}
+roles: dict[int: dict[str, int]] = {}
 role_query = """SELECT role_name, role_id FROM roles;"""
-players: dict[int, int] = {}
-player_query = """SELECT discord_id, player_id FROM players;"""
+
+CHANNELS_TEMPLATE = [
+    'admin', 'commands', 'email', 'email-database', 'game', 'game-test', 'graph',
+    'graph-test', 'ledgers', 'ledgers-test', 'manage', 'music', 'query', 'query-test', 'roles'
+]
+ROLES_TEMPLATE = ['fiend', 'admin', 'fiend bot', 'email needed']
 
 
-def populate_dictionaries():
-    global channels, roles, players
-    data = {}
-
+async def populate_dictionaries():
+    global channels, roles
     try:
-        with connect() as connection:
-            zipped = zip(['channels', 'roles', 'players'],
-                         [channel_query, role_query, player_query])
-            for dictionary, dict_query in zipped:
-                result, columns = query(connection, dict_query)
-                data[dictionary] = {key: value for key, value in result}
-        disconnect(connection)
-
-        channels = data['channels']
-        roles = data['roles']
-        players = data['players']
+        logger.info(f'Servers: {[(guild.name, guild.id) for guild in client.guilds]}')
+        for guild in client.guilds:
+            guild_channels = [c for c in await guild.fetch_channels() if
+                              isinstance(c, discord.TextChannel) and c.name in CHANNELS_TEMPLATE]
+            channels[guild.id] = {c.name: c.id for c in guild_channels}
+            guild_roles = [r for r in await guild.fetch_roles() if r.name in ROLES_TEMPLATE]
+            roles[guild.id] = {r.name: r.id for r in guild_roles}
     except Exception as err:
         logger.warning('Using Default Dictionary Values: %s', err)
-        # This is to default hard-code dictionaries for necessary channels/roles
-        roles = {'admin': 1,
-                 'email_needed': 2,
-                 'poker_bot': 3,
-                 'star': 4,}
-        channels = {'graph': 1,
-                    'ledgers': 2,
-                    'query': 3,
-                    'email': 4,
-                    'email_database': 5,
-                    'game': 6,
-                    'admin': 7,}
-        players = {}
+        # This is to default hard-code dictionaries in primary server for necessary channels/roles
+        roles = {1:
+                     {'fiend': 1,
+                      'admin': 2,
+                      'fiend bot': 3,
+                      'email needed': 4,
+                      }
+                 }
+        channels = {1:
+                        {'admin': 1,
+                         'commands': 2,
+                         'email': 3,
+                         'email-database': 4,
+                         'game': 5,
+                         'game-test': 6,
+                         'graph': 7,
+                         'graph-test': 8,
+                         'ledgers': 9,
+                         'ledgers-test': 10,
+                         'manage': 11,
+                         'music': 12,
+                         'query': 13,
+                         'query-test': 14,
+                         'roles': 15,
+                         }
+                    }
+    finally:
+        for guild_id, mapping in channels.items():
+            for name in CHANNELS_TEMPLATE:
+                mapping.setdefault(name, 0)
+        for guild_id, mapping in roles.items():
+            for name in ROLES_TEMPLATE:
+                mapping.setdefault(name, 0)
 
 
-async def attachments_to_images(attachments_list: list[list[discord.Attachment]]) -> list[list[Image.Image]]:
+async def attachments_to_bytes(attachments_list: list[list[discord.Attachment]]) -> list[list[tuple[bytes, str]]]:
     images = []
     try:
         for sublist in attachments_list:
             row = []
             for attachment in sublist:
                 img_bytes = await attachment.read()
-                image = Image.open(io.BytesIO(img_bytes))
-                row.append(image)
+                img_type = attachment.content_type
+                img_pair = (img_bytes, img_type)
+                row.append(img_pair)
             images.append(row)
     except Exception as err:
         logger.exception('Error Converting Attachments to Images: %s', err)
@@ -86,10 +114,10 @@ async def attachments_to_images(attachments_list: list[list[discord.Attachment]]
     return images
 
 
-async def game_jump(content: str) -> Optional[discord.Message]:
+async def game_jump(message: discord.Message) -> Optional[discord.Message]:
     game_jump_message = None
-    given_link = [word for word in content.split() if JUMP_URL_PREFIX in word]
-    game_channel = client.get_channel(channels['game'])
+    given_link = [word for word in message.content.split() if JUMP_URL_PREFIX in word]
+    game_channel = client.get_channel(channels[message.guild.id]['game'])
     if given_link:
         # this is specifically fetching within #game
         try:
@@ -108,163 +136,333 @@ async def game_jump(content: str) -> Optional[discord.Message]:
     return game_jump_message
 
 
+def dump_database():
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    dump_file = f"db/dump_{timestamp}.sql"
+
+    try:
+        subprocess.run([
+            "pg_dump",
+            "--format=plain",
+            "--section=pre-data",
+            "--section=data",
+            "--section=post-data",
+            "--blobs",
+            "--no-owner",
+            DATABASE_URL,
+            "-f",
+            dump_file
+        ], check=True)
+        logger.info(f"Database dumped to {dump_file}")
+    except subprocess.CalledProcessError as e:
+        logger.info(f"Database dump failed: {e}")
+
+
+def dump_database_once():
+    global has_dumped
+    if not has_dumped:
+        dump_database()
+        has_dumped = True
+    else:
+        logger.info('Database has already been dumped')
+
+
+async def shutdown():
+    logger.info("Shutting down bot, dumping database if not already done...")
+    dump_database_once()
+    if not client.is_closed():
+        try:
+            for guild in client.guilds:
+                channel = client.get_channel(channels[guild.id]['admin'])
+                if channel is not None:
+                    await channel.send("FindBot Offline! Shutting down...")
+                else:
+                    logger.info("Channel not found in cache.")
+        except Exception as e:
+            logger.warning(f"Failed to send shutdown message: {e}")
+
+    await client.close()
+
+
+def handle_signal(sig, _):
+    # _ is a stand in for frame
+    logger.info(f"Received signal {sig}, shutting down...")
+    asyncio.get_event_loop().create_task(shutdown())
+
+
+signal.signal(signal.SIGINT, handle_signal)
+signal.signal(signal.SIGTERM, handle_signal)
+
+
 @client.event
 async def on_ready():
-    populate_dictionaries()
+    await populate_dictionaries()
     logger.info('%s is now running!', client.user)
+    for guild in client.guilds:
+        admin_id = channels.get(guild.id, {}).get("admin")
+        if admin_id is not None:
+            channel = client.get_channel(admin_id)
+            if channel:
+                await channel.send('FiendBot Online! At Your Service!')
+
+
+def update_guild_channel(
+    new_channel: Optional[discord.abc.GuildChannel] = None,
+    old_channel: Optional[discord.abc.GuildChannel] = None
+):
+    if old_channel and isinstance(old_channel, discord.TextChannel) and old_channel.name in CHANNELS_TEMPLATE:
+        logger.info(f"Removing #{old_channel.name} in {old_channel.guild.name}")
+        guild_channels = channels.setdefault(old_channel.guild.id, {})
+        guild_channels[old_channel.name] = 0
+
+    if new_channel and isinstance(new_channel, discord.TextChannel) and new_channel.name in CHANNELS_TEMPLATE:
+        logger.info(f"Updating #{new_channel.name} in {new_channel.guild.name}")
+        guild_channels = channels.setdefault(new_channel.guild.id, {})
+        guild_channels[new_channel.name] = new_channel.id
+
+
+@client.event
+async def on_guild_channel_create(channel: discord.abc.GuildChannel):
+    update_guild_channel(channel)
+
+@client.event
+async def on_guild_channel_update(before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
+    if before.name != after.name:
+        update_guild_channel(after, before)
+
+@client.event
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+    update_guild_channel(old_channel=channel)
+
+
+def update_guild_role(
+    new_role: Optional[discord.Role] = None,
+    old_role: Optional[discord.Role] = None
+):
+    if old_role and old_role.name in ROLES_TEMPLATE:
+        logger.info(f"Removing @{old_role.name} in {old_role.guild.name}")
+        guild_roles = roles.setdefault(old_role.guild.id, {})
+        guild_roles[old_role.name] = 0
+
+    if new_role and new_role.name in ROLES_TEMPLATE:
+        logger.info(f"Updating @{new_role.name} in {new_role.guild.name}")
+        guild_roles = roles.setdefault(new_role.guild.id, {})
+        guild_roles[new_role.name] = new_role.id
+
+
+
+@client.event
+async def on_guild_role_create(role: discord.Role):
+    update_guild_role(role)
+
+@client.event
+async def on_guild_role_update(before: discord.Role, after: discord.Role):
+    if before.name != after.name:
+        update_guild_role(after, before)
+
+@client.event
+async def on_guild_role_delete(role: discord.Role):
+    update_guild_role(old_role=role)
+
+
+@client.event
+async def on_guild_join(guild: discord.Guild):
+    await populate_dictionaries()
+    logger.info('%s Just Joined %s', client.user, guild.name)
+    await client.get_channel(channels[guild.id]['admin']).send('FiendBot Online! At Your Service!')
 
 
 @client.event
 async def on_message(message: discord.Message):
-    # MULTI-SERVER IMPLEMENTATION:
-    #    If message.guild.id not in channels: return
-    #    Implement nested dicts throughout: i.e., roles[message.guild.id]['admin']
     global channels
     global roles
 
-    if message.channel.id == channels['email']:
-        email_database_channel = client.get_channel(channels['email_database'])
-        # loop through #email-database to remove old email if present
+    guild = message.guild
+    guild.id = guild.id
+    if message.channel.id == channels[guild.id]['email']:
+        email_database_channel = client.get_channel(channels[guild.id]['email-database'])
         # newest to oldest
         async for entry in email_database_channel.history():
             if message.author in entry.mentions:
                 await entry.delete()
         await email_database_channel.send(f'<@{message.author.id}> {message.content}')
         return
-    elif message.channel.id == channels['admin']:
+    elif message.channel.id == channels[guild.id]['manage']:
         if message.author == client.user:
             return
-        elif message.content.startswith('!'):
-            txt = message.content[1:]
-            words = txt.split()
-            channel_pattern = r"^<#(\d+)>$"
-            message_pattern = fr"^{re.escape(JUMP_URL_PREFIX)}{message.guild.id}/(\d+)/(\d+)$"
-            channel_match = re.match(channel_pattern, words[0]) if words else None
-            message_match = re.match(message_pattern, words[0]) if words else None
-
-            if not words:
-                await message.channel.send('!add_games, !add_ledgers, ![#channel] <- compose, ![message link] <- edit')
-                return
-            elif words[0] == 'add_games':
-                # message: !add_games MM DD YYYY
-                if len(words) > 1:
-                    m = int(words[1])
-                    d = int(words[2])
-                    y = int(words[3])
-                    logger.debug('Starting to Add Games to Database')
-                    game_query = """INSERT INTO games (url, date) VALUES (%s, %s);"""
-                    links = []
-                    game_channel = client.get_channel(channels['game'])
-                    # finding messages in #game with a pokernow url, oldest to newest
-                    async for entry in game_channel.history(after=datetime.datetime(year=y, month=m, day=d)):
-                        if POKERNOW in entry.content:
-                            words_with_url = [word for word in entry.content.split() if POKERNOW in word]
-                            links.append([words_with_url[0], entry.created_at.strftime('%m-%d-%y'), entry.created_at])
-                    try:
-                        with connect() as connection:
-                            for item in links:
-                                # unique part of pokernow_url
-                                query(connection, game_query, item[0].split()[-1].rpartition('/')[2], item[-1])
-                        disconnect(connection)
-                    except Exception as err:
-                        logger.warning('No Games Inserted: %s', err)
-                    return
-                else:
-                    await message.channel.send('!add_games MM DD YYYY')
-                    return
-            elif words[0] == 'add_ledgers':
-                # message: !add_ledgers {game_id of 1st ledger} MM DD YYYY [MM DD YYY] <-- [optional end date]
-                if len(words) in (5 , 8):
-                    logger.debug('Starting to Add Ledgers to Database')
-                    game_id = int(words[1])
-                    m = int(words[2])
-                    d = int(words[3])
-                    y = int(words[4])
-                    after = datetime.datetime(month=m, day=d, year=y)
-                    before = (
-                        datetime.datetime(month=int(words[5]), day=int(words[6]), year=int(words[7]))
-                        if len(words) == 8
-                        else datetime.datetime.now()
-                    )
-                    i = 0
-                    attachments_list = []
-                    buffer = None
-                    ledgers_channel = client.get_channel(channels['ledgers'])
-                    # oldest to newest
-                    async for entry in ledgers_channel.history(after=after, before=before):
-                        if entry.attachments:
-                            if not attachments_list or entry.created_at - buffer >= datetime.timedelta(minutes=2):
-                                i += 1
-                                attachments_list.append(entry.attachments)
-                                buffer = entry.created_at
-                            else:
-                                attachments_list[-1] = attachments_list[-1] + entry.attachments
-                    images_list = await attachments_to_images(attachments_list=attachments_list)
-                    results = []
-                    for index, sublist in enumerate(images_list):
-                        results.append(await asyncio.to_thread(ledger_gemini.gemini, sublist, game_id=game_id + index))
-                    ledger_gemini.insert_ledgers(ledger_gemini.format_ledgers(results), game_id=game_id)
-                    logger.info('\n%s Ledgers Uploaded', len(images_list))
-                    return
-                else:
-                    await message.channel.send('!add_ledgers GID MM DD YYYY')
-                    return
-            elif channel_match:
-                # ! #channel [body] <-- [optional body if attachments included]
-                # group[1] == {channel_id where new message to be sent}
-                new_content = txt.split(channel_match.group())[1]
-                channel = message.channel_mentions[0]
-                attachments = message.attachments
-                if not new_content and not attachments:
-                    await message.channel.send('Compose Error: Missing message text/attachments')
-                    return
-                elif not new_content:
-                    await channel.send(file=await attachments[0].to_file())
-                else:
-                    await channel.send(new_content, files=[await attachments[0].to_file()] if attachments else [])
-
-                if attachments:
-                    for file in attachments[1:]:
-                        await channel.send(file=await file.to_file())
-                await message.channel.send(f'*Message Sent In: {channel.jump_url}')
-                return
-            elif message_match:
-                # ! {message_link} [body] <-- [optional body if attachments included]
-                # group[1] == {channel_id for the location of the message to be edited}
-                # group[2] == {message_id of the message to be edited}
-                # Edits with text, but no attachments will not alter existing attachments, same thing vice versa
-                cid, mid = message_match.group(1), message_match.group(2)
-                if cid.isdigit() and mid.isdigit():
-                    new_content = txt.split(message_match.group())[1]
-                    attachments = message.attachments
-                    old = await client.get_channel(int(cid)).fetch_message(int(mid))
-                    if not new_content and not attachments:
-                        await message.channel.send('Edit Error: Missing message text/attachments')
-                        return
-                    elif not new_content:
-                        await old.edit(attachments=[await att.to_file() for att in attachments])
-                        return
-                    elif not attachments:
-                        await old.edit(content=new_content)
+        txt = message.content.strip()
+        if txt and txt.startswith('!'):
+            words = txt[1:].lower().split()
+            if words:
+                command = words[0]
+                arguments = words[1:]
+                if command == 'restart':
+                    await message.channel.send("Restarting bot...")
+                    await client.get_channel(channels[guild.id]['admin']).send("FindBot Offline! Shutting down...")
+                    dump_database_once()
+                    await asyncio.sleep(1)
+                    logger.info(f'Restarting bot...')
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+                elif command == 'add_games':
+                    # message: !add_games MM DD YYYY
+                    if len(arguments) > 1:
+                        m = int(arguments[0])
+                        d = int(arguments[1])
+                        y = int(arguments[2])
+                        logger.debug('Starting to Add Games to Database')
+                        game_query = """INSERT INTO games (url, date) VALUES (%s, %s);"""
+                        links = []
+                        game_channel = client.get_channel(channels[guild.id]['game'])
+                        # oldest to newest
+                        async for entry in game_channel.history(after=datetime.datetime(year=y, month=m, day=d)):
+                            if POKERNOW in entry.content:
+                                words_with_url = [word for word in entry.content.split() if POKERNOW in word]
+                                links.append([words_with_url[0], entry.created_at.strftime('%m-%d-%y'), entry.created_at])
+                        try:
+                            with connect() as connection:
+                                for item in links:
+                                    # unique part of pokernow url
+                                    query(connection, game_query, item[0].split()[-1].rpartition('/')[2], item[-1])
+                            disconnect(connection)
+                        except Exception as err:
+                            logger.warning('No Games Inserted: %s', err)
                         return
                     else:
-                        await old.edit(content=new_content, attachments=[await att.to_file() for att in attachments])
+                        await message.channel.send('!add_games MM DD YYYY')
                         return
+                elif command == 'add_ledgers':
+                    # message: !add_ledgers {game_id of 1st ledger} MM DD YYYY [MM DD YYY] <-- [optional end date]
+                    if len(arguments) in (4 , 7):
+                        logger.debug('Starting to Add Ledgers to Database')
+                        game_id = int(arguments[0])
+                        m = int(arguments[1])
+                        d = int(arguments[2])
+                        y = int(arguments[3])
+                        after = datetime.datetime(month=m, day=d, year=y)
+                        before = (
+                            datetime.datetime(month=int(arguments[4]), day=int(arguments[5]), year=int(arguments[6]))
+                            if len(arguments) == 7
+                            else datetime.datetime.now()
+                        )
+                        i = 0
+                        attachments_list = []
+                        buffer = None
+                        ledgers_channel = client.get_channel(channels[guild.id]['ledgers'])
+                        # oldest to newest
+                        async for entry in ledgers_channel.history(after=after, before=before):
+                            if entry.attachments:
+                                if not attachments_list or entry.created_at - buffer >= datetime.timedelta(minutes=2):
+                                    i += 1
+                                    attachments_list.append(entry.attachments)
+                                    buffer = entry.created_at
+                                else:
+                                    attachments_list[-1] = attachments_list[-1] + entry.attachments
+                        images_list = await attachments_to_bytes(attachments_list=attachments_list)
+                        results = []
+                        for index, sublist in enumerate(images_list):
+                            results.append(await asyncio.to_thread(ledger_gemini.gemini, sublist, game_id=game_id + index))
+                        ledgers_sum = ledger_gemini.insert_ledgers(ledger_gemini.format_ledgers(results), game_id=game_id)
+                        logger.info('%s Ledgers Uploaded', len(images_list))
+                        if ledgers_sum:
+                            await message.channel.send(f'Unbalanced Ledgers Sum: {ledgers_sum}')
+                            logger.warning('Unbalanced Ledgers Sum: %s', ledgers_sum)
+                        return
+                    else:
+                        await message.channel.send('!add_ledgers GID MM DD YYYY')
+                        return
+                else:
+                    channel_pattern = r"^<#(\d+)>$"
+                    message_pattern = fr"^{re.escape(JUMP_URL_PREFIX)}{message.guild.id}/(\d+)/(\d+)$"
+                    channel_match = re.match(channel_pattern, command)
+                    message_match = re.match(message_pattern, command)
+                    if channel_match:
+                        # ! #channel [body] <-- [body is optional if attachments are included]
+                        # group[1] == {channel_id where new message to be sent}
+                        new_content = txt.split(channel_match.group())[1].strip()
+                        channel = message.channel_mentions[0]
+                        attachments = message.attachments
+                        if not new_content and not attachments:
+                            await message.channel.send('Compose Error: Missing message text/attachments')
+                            return
+                        elif not new_content:
+                            await channel.send(file=await attachments[0].to_file())
+                        elif attachments:
+                            await channel.send(new_content, files=[await attachments[0].to_file()])
+                        else:
+                            await channel.send(new_content)
+                            return
+
+                        if attachments:
+                            for file in attachments[1:]:
+                                await channel.send(file=await file.to_file())
+                        await message.channel.send(f'*Message Sent In: {channel.jump_url}')
+                        return
+                    elif message_match:
+                        # ! {message_link} [body] <-- [optional body if attachments included]
+                        # group[1] == {channel_id for the location of the message to be edited}
+                        # group[2] == {message_id of the message to be edited}
+                        # Edits with text, but no attachments will not alter existing attachments, same thing vice versa
+                        cid, mid = message_match.group(1), message_match.group(2)
+                        if cid.isdigit() and mid.isdigit():
+                            new_content = txt.split(message_match.group())[1].strip()
+                            attachments = message.attachments
+                            old = await client.get_channel(int(cid)).fetch_message(int(mid))
+                            if not new_content and not attachments:
+                                await message.channel.send('Edit Error: Missing message text/attachments')
+                                return
+                            elif not new_content:
+                                await old.edit(attachments=[await att.to_file() for att in attachments])
+                                return
+                            elif attachments:
+                                await old.edit(content=new_content,
+                                               attachments=[await att.to_file() for att in attachments])
+                                return
+                            else:
+                                await old.edit(content=new_content)
+                                return
             else:
                 await message.channel.send('!add_games, !add_ledgers, ![#channel] <- compose, ![message link] <- edit')
                 return
         return
-    elif message.channel.id == channels['query']:
+    elif message.channel.id == channels[guild.id]['commands']:
+        if message.author == client.user:
+            return
+        txt = message.content.strip()
+        if txt and txt.startswith('!'):
+            words = txt[1:].split()
+            if words:
+                command = words[0]
+                arguments = words[1:]
+                if command == 'table':
+                    if arguments:
+                        with connect() as connection:
+                            table_query = f"""Select * from {arguments[0]}"""
+                            ans, cols = query(connection, table_query)
+                            answer = pd.DataFrame(ans, columns=cols)
+                            answer.index += 1
+                            with pd.option_context('display.min_rows', 25, 'display.max_rows', 25):
+                                await message.channel.send(f'```{answer}```')
+                        disconnect(connection)
+                        return
+                else:
+                    await message.channel.send('Unknown Command')
+                    return
+
+                await message.channel.send('Missing/Invalid Arguments')
+            else:
+                await message.channel.send('!table, more commands soon')
+        return
+    elif message.channel.id in (channels[guild.id]['query'], channels[guild.id]['query-test']):
         if message.author == client.user:
             return
         elif not message.content.strip().startswith('!'):
             return
-
         txt = message.content.strip()[1:]
         if not txt or txt == 'help':
             await message.channel.send("!leaderboard, !leaderboard_avg, !career, !graph, !players")
         else:
             option = txt.split()[0]
+            arguments = txt.split()[1:]
             if option == 'players':
                 ans, columns = query_presets.players()
                 if ans:
@@ -297,7 +495,7 @@ async def on_message(message: discord.Message):
                 await message.channel.send("!Include exactly 1 player name. !career name. !players.")
                 return
             elif option == 'graph':
-                career_graph = query_presets.career_graph(txt.split()[1:])
+                career_graph = query_presets.career_graph(arguments)
                 if career_graph:
                     graph_file = discord.File(career_graph, filename='career_graph.png')
                     await message.channel.send(file=graph_file)
@@ -306,8 +504,10 @@ async def on_message(message: discord.Message):
                 return
             elif option == 'recent':
                 days = 30
-                if txt.split()[1:]: days = txt.split()[1]
-                recent_graph = query_presets.recent_graph(days)
+                if arguments and arguments[0].isdigit():
+                    days = arguments[0]
+                    arguments = arguments[1:]
+                recent_graph = query_presets.recent_graph(days, arguments)
                 if recent_graph:
                     recent_file = discord.File(recent_graph, filename='recent_graph.png')
                     await message.channel.send(file=recent_file)
@@ -316,14 +516,13 @@ async def on_message(message: discord.Message):
                 return
             return
         return
-    elif message.channel.id == channels['ledgers']:
+    elif message.channel.id in (channels[guild.id]['ledgers'], channels[guild.id]['ledgers-test']):
         if message.author == client.user:
             return
         elif not message.attachments:
             return
 
-        # game_jump = game_jump_url(message)
-        game_jump_message = await game_jump(message.content)
+        game_jump_message = await game_jump(message)
         game_jump_url = game_jump_message.jump_url if game_jump_message else 'Cannot find game'
         attachments = message.attachments
         await message.channel.send(f'Ledger for: {game_jump_url}', file=await attachments[0].to_file())
@@ -332,6 +531,12 @@ async def on_message(message: discord.Message):
         await message.delete()
 
         if game_jump_message:
+            if message.channel.id == channels[guild.id]['ledgers-test']:
+                if '!' in message.content:
+                    await message.channel.send('Inserting Ledger')
+                else:
+                    await message.channel.send('Not Inserting Ledger', delete_after=5)
+                    return
             words_with_url = [word for word in game_jump_message.content.split() if POKERNOW in word]
             url = words_with_url[0].rpartition('/')[2]
             game_query = """INSERT INTO games (url, date) VALUES (%s, %s)
@@ -344,20 +549,21 @@ async def on_message(message: discord.Message):
                 logger.warning('Unable to Insert Game: %s\nurl = %s', err, url)
 
             if ans:
-                images_list = await attachments_to_images([attachments])
+                images_list = await attachments_to_bytes([attachments])
                 results = []
                 for sublist in images_list:
                     results.append(await asyncio.to_thread(ledger_gemini.gemini, sublist, game_id=ans[0][0]))
-                ledger_gemini.insert_ledgers(ledger_gemini.format_ledgers(results), game_id=ans[0][0])
+                ledgers_sum = ledger_gemini.insert_ledgers(ledger_gemini.format_ledgers(results), game_id=ans[0][0])
                 logger.info('%s Ledger(s) Inserted', len(images_list))
+                if ledgers_sum:
+                    await message.channel.send(f'Unbalanced Ledgers Sum: {ledgers_sum}')
+                    logger.warning('Unbalanced Ledgers Sum: %s', ledgers_sum)
             else:
                 logger.info('Ledgers Skipped, Game Already Exists')
         return
-    elif message.channel.id == channels['graph']:
+    elif message.channel.id in (channels[guild.id]['graph'], channels[guild.id]['graph-test']):
         if message.author == client.user:
             return
-
-        # start to generate chart(s) of provided game
         attachments = message.attachments
         if len(attachments) == 2:
             file_names = (attachments[0].filename, attachments[1].filename)
@@ -367,7 +573,7 @@ async def on_message(message: discord.Message):
                 attachment_one = await attachments[0].read()
                 attachment_two = await attachments[1].read()
 
-                game_jump_message = await game_jump(message.content)
+                game_jump_message = await game_jump(message)
                 game_jump_url = game_jump_message.jump_url if game_jump_message else 'Cannot find game'
 
                 # This does not enforce or check if the log and ledgers are truly corresponding
@@ -375,7 +581,7 @@ async def on_message(message: discord.Message):
 
                 if nets_graph:
                     try:
-                        # According to API, the File object is only to be used once
+                        # According to Official Documentation, the File object is only to be used once
                         nets_file = discord.File(nets_graph, filename='nets.png')
                         await message.channel.send(f'Nets for: {game_jump_url}', file=nets_file)
 
@@ -392,14 +598,13 @@ async def on_message(message: discord.Message):
             await message.channel.send(f'Please attach both log and ledger .csv files for the session')
             await message.delete()
         return
-    elif message.channel.id == channels['email_database']:
-        guild = message.guild
+    elif message.channel.id == channels[guild.id]['email-database']:
         member = message.mentions[0]
         member_name = member.display_name
         member_id = member.id
         member_email = message.content.split()[1]
 
-        email_needed_role = guild.get_role(roles['email_needed'])
+        email_needed_role = guild.get_role(roles[guild.id]['email needed'])
         await member.remove_roles(email_needed_role)
 
         insert_player_query = """INSERT INTO players (name, discord_id, email) 
@@ -412,17 +617,15 @@ async def on_message(message: discord.Message):
             disconnect(connection)
         except Exception as err:
             logger.exception('Unable to Update Player Email: %s', err)
-        else:
-            populate_dictionaries()
         return
-    elif message.channel.id == channels['game']:
+    elif message.channel.id in (channels[guild.id]['game'], channels[guild.id]['game-test']):
         if message.author == client.user:
             return
         elif not POKERNOW in message.content:
             return
-        ping = f"<@&{roles['star']}>"
+        ping = f"<@&{roles[guild.id]['fiend']}>"
         link = [word for word in message.content.split() if POKERNOW in word][0]
-        email_database_channel = client.get_channel(channels['email_database'])
+        email_database_channel = client.get_channel(channels[guild.id]['email-database'])
         email = None
         # newest to oldest
         async for entry in email_database_channel.history():
@@ -434,7 +637,8 @@ async def on_message(message: discord.Message):
                     return
                 break
         missing_email = f"Lobby creator must first register an email with the server." \
-                        f"\nAdd one to <#{channels['email']}> or contact an <@&{roles['admin']}> for access."
+                        f"\nAdd one to <#{channels[guild.id]['email']}> " \
+                        "or contact an <@&{roles[guild.id]['admin']}> for access."
         await message.channel.send(missing_email)
         await message.delete()
         return

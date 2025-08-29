@@ -1,14 +1,13 @@
 import argparse
 import logging
+import mimetypes
 import os
 import threading
 import time
-from typing import Optional
 
 from dotenv import load_dotenv
-import google.generativeai as genai
+from google import genai
 import pandas as pd
-from PIL import Image
 from rapidfuzz import fuzz, process
 
 from src.connect import connect, disconnect, query
@@ -17,12 +16,10 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-ERROR_CODE = 'Error-0001'
-
 done = False
 
-def gemini(images: list[Image.Image], game_id=None) -> tuple[pd.DataFrame, Optional[bool]]:
-    global ERROR_CODE
+
+def gemini(images: list[tuple[bytes, str]], game_id=None) -> pd.DataFrame:
     prefix = f'{game_id}: ' if game_id is not None else ''
     try:
         GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
@@ -30,31 +27,42 @@ def gemini(images: list[Image.Image], game_id=None) -> tuple[pd.DataFrame, Optio
         if GEMINI_API_KEY is None:
             logger.error('Error: GOOGLE_API_KEY environment variable not set.')
 
-        genai.configure(api_key=GEMINI_API_KEY)
+        try:
+            client = genai.Client()
+        except Exception as e:
+            logger.error(f"Failed to create GenAI client. Ensure GEMINI_API_KEY is set. Error: {e}")
+            return pd.DataFrame()
 
-        # Using the gemini-2.5-pro model for multimodal input
-        vision_model = genai.GenerativeModel('gemini-2.5-pro')
-
+        image_parts = []
+        for img_bytes, mime_type in images:
+            image_parts.append(
+                genai.types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
+            )
         # Prompt for the vision model
         prompt = ('Convert the single ledger in the photo(s) to a table. If there are multiple photos, '
                   'the ledger has been split and may or may not contain duplicated rows across the photos.'
                   '\nColumns: PLAYER, ID, BUY-IN, BUY-OUT, STACK, NET; '
                   'where player is the string before the @ sign, and id is the string after the @ sign.'
-                  '\nWhen completed, if the absolute value of sum[NET] is greater than 0.02, start your response with:'
-                  f' "{ERROR_CODE} [Imbalance]:".\nRespond with only the table and error above it if applicable.')
-        request = [prompt] + images
+                  f'\nRespond with only the table, continue with output regardless of any issue or error.')
+        #prompt = 'What do you see in these photos'
+        text_part = genai.types.Part.from_text(text=prompt)
+        contents = [
+            text_part,
+            image_parts
+        ]
         logger.info('%sSending %s image(s) with default prompt.', prefix, len(images))
-        response = vision_model.generate_content(request)
+        response = client.models.generate_content(
+            model='gemini-2.0-flash',
+            contents=contents
+        )
     except Exception as e:
-        logger.error('%sError generating Gemini response. %s', prefix, e, exc_info=True)
-        return pd.DataFrame(), None
+        logger.exception('%sError generating Gemini response. %s', prefix, e)
+        return pd.DataFrame()
     try:
         lines = response.text.strip().splitlines()
-        error = ERROR_CODE in response.text
-        status = 'Error: Imbalance' if error else 'Passed'
-        logger.info('%sResponse Complete -> %s!', prefix, status)
+        logger.info('%sResponse Completed', prefix)
 
-        # trimming leading and trailing whitespace | ignoring: blank lines, error/stub rows, line of dashes from table
+        # trimming leading and trailing whitespace | ignoring: blank lines, stub rows, line of dashes from table
         ledgers = [l for line in lines if (l := line.strip()) and len(line) > 30 and any(c.isalpha() for c in line)]
         rows = [line.strip('|').split('|') for line in ledgers]
         rows = [[cell.strip() for cell in row] for row in rows]
@@ -63,13 +71,13 @@ def gemini(images: list[Image.Image], game_id=None) -> tuple[pd.DataFrame, Optio
         df = df.drop(columns=['BUY-IN']).drop(columns=['BUY-OUT']).drop(columns=['STACK'])
         df = df.rename(columns={'PLAYER': 'alias'}).rename(columns={'ID': 'user_id'}).rename(columns={'NET': 'net'})
         df['net'] = (df['net'].astype(float) * 100).round().astype(int)
-        return df, error
+        return df
     except Exception as e:
-        logger.error('Error formatting response from Gemini: %s', e, exc_info=True)
-        return pd.DataFrame(), None
+        logger.exception('Error formatting response from Gemini: %s', e)
+        return pd.DataFrame()
 
 
-def format_ledgers(data: list[tuple[pd.DataFrame, bool]]) -> list[tuple[pd.DataFrame, bool]]:
+def format_ledgers(data: list[pd.DataFrame]) -> list[pd.DataFrame]:
     try:
         user_query = """SELECT user_id FROM users;"""
         with connect() as connection:
@@ -80,23 +88,22 @@ def format_ledgers(data: list[tuple[pd.DataFrame, bool]]) -> list[tuple[pd.DataF
     else:
         users = [item[0] for item in ans]
         try:
-            threshold = 76.0
-            for pair in data:
-                for i in pair[0].index:
-                    user_id_ocr = pair[0].at[i, 'user_id']
+            threshold = 70.1
+            for df in data:
+                for i in df.index:
+                    user_id_ocr = df.at[i, 'user_id']
                     match = process.extractOne(user_id_ocr, users, scorer=fuzz.ratio)
                     if match and match[1] >= threshold:
-                        pair[0].at[i, 'user_id'] = match[0]
+                        df.at[i, 'user_id'] = match[0]
         except Exception as e:
             logger.warning('Warning, Fuzzy Pattern Matching Failed: %s', e)
 
     return data
 
 
-def insert_ledgers(results: list[tuple[pd.DataFrame, bool]], game_id: int):
+def insert_ledgers(results: list[pd.DataFrame], game_id: int):
     if results:
         logger.info('Ledgers Completed')
-
         game_query = """INSERT INTO games (game_id, url, date) VALUES (%s, %s, CURRENT_DATE) 
                             ON CONFLICT DO NOTHING RETURNING game_id;"""
         clear_query = """DELETE FROM ledgers WHERE game_id = %s;"""
@@ -106,25 +113,38 @@ def insert_ledgers(results: list[tuple[pd.DataFrame, bool]], game_id: int):
         ledger_query = """INSERT INTO ledgers (game_id, user_id, net, alias) 
                         VALUES (%s, %s, %s, %s)
                         ON CONFLICT (game_id, user_id) DO NOTHING;"""
+        sum_query = """SELECT SUM(net) FROM ledgers"""
         try:
             with connect() as connection:
                 # [alias, user_id, net]
-                for df, error in results:
-                    query(connection, game_query, game_id, game_id)
-                    query(connection, clear_query, game_id)
-                    for row in df.itertuples(index=False):
-                        ans1, cols1 = query(connection, select_user_query, row.user_id)
-                        if not ans1:
-                            ans2, cols2 = query(connection, create_player_query, row.alias)
-                            query(connection, create_user_query, ans2[0], row.user_id)
-
-                        query(connection, ledger_query, game_id, row.user_id, row.net, row.alias)
+                for df in results:
+                    if not df.empty:
+                        query(connection, game_query, game_id, game_id)
+                        query(connection, clear_query, game_id)
+                        for row in df.itertuples(index=False):
+                            ans1, cols1 = query(connection, select_user_query, row.user_id)
+                            if not ans1:
+                                ans2, cols2 = query(connection, create_player_query, row.alias)
+                                query(connection, create_user_query, ans2[0], row.user_id)
+                            query(connection, ledger_query, game_id, row.user_id, row.net, row.alias)
+                        logger.info('Inserting at %s', game_id)
                     game_id += 1
-                logger.info('Finished Inserting at %s', game_id - 1)
             disconnect(connection)
         except Exception as e:
             logger.error('Unable to Insert Ledgers: %s', e)
 
+        try:
+            with connect() as connection:
+                ledgers_sum, _ = query(connection, sum_query)
+                ledgers_sum = ledgers_sum[0][0]
+            disconnect(connection)
+        except Exception as e:
+            logger.warning('Unable to Retrieve Sum of Ledgers: %s', e)
+            ledgers_sum = 0
+
+        return ledgers_sum
+    else:
+        return -1
 
 def spinner():
     global done
@@ -147,8 +167,10 @@ def main():
     game_id = args.game_id
     image_list = []
     for img in images:
-        image = Image.open(img)
-        image_list.append(image)
+        mime_type, _ = mimetypes.guess_type(img)
+        with open(img, "rb") as f:
+            img_bytes = f.read()
+        image_list.append((img_bytes, mime_type))
 
     global done
     done = False
@@ -159,10 +181,13 @@ def main():
     t.join()
 
     if game_id is not None:
-        insert_ledgers(format_ledgers([response]), game_id)
+        ledgers_sum = insert_ledgers(format_ledgers([response]), game_id)
+        if ledgers_sum:
+            print(ledgers_sum)
     else:
         print()
-        if response[1]: print('Error!')
+        if response[1]:
+            print('Error!')
         print(response[0])
 
 
