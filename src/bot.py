@@ -132,14 +132,12 @@ async def game_jump(message: discord.Message) -> Optional[discord.Message]:
             if POKERNOW in entry.content:
                 game_jump_message = entry
                 break
-
     return game_jump_message
 
 
 def dump_database():
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     dump_file = f"db/dump_{timestamp}.sql"
-
     try:
         subprocess.run([
             "pg_dump",
@@ -167,17 +165,21 @@ def dump_database_once():
         logger.info('Database has already been dumped')
 
 
+async def shutdown_message():
+    for guild in client.guilds:
+        channel = client.get_channel(channels[guild.id]['admin'])
+        if channel is not None:
+            await channel.send("FindBot Offline - Shutting down...")
+        else:
+            logger.info("Channel not found in cache.")
+
+
 async def shutdown():
     logger.info("Shutting down bot, dumping database if not already done...")
     dump_database_once()
     if not client.is_closed():
         try:
-            for guild in client.guilds:
-                channel = client.get_channel(channels[guild.id]['admin'])
-                if channel is not None:
-                    await channel.send("FindBot Offline! Shutting down...")
-                else:
-                    logger.info("Channel not found in cache.")
+            await shutdown_message()
         except Exception as e:
             logger.warning(f"Failed to send shutdown message: {e}")
 
@@ -225,10 +227,12 @@ def update_guild_channel(
 async def on_guild_channel_create(channel: discord.abc.GuildChannel):
     update_guild_channel(channel)
 
+
 @client.event
 async def on_guild_channel_update(before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
     if before.name != after.name:
         update_guild_channel(after, before)
+
 
 @client.event
 async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
@@ -250,15 +254,16 @@ def update_guild_role(
         guild_roles[new_role.name] = new_role.id
 
 
-
 @client.event
 async def on_guild_role_create(role: discord.Role):
     update_guild_role(role)
+
 
 @client.event
 async def on_guild_role_update(before: discord.Role, after: discord.Role):
     if before.name != after.name:
         update_guild_role(after, before)
+
 
 @client.event
 async def on_guild_role_delete(role: discord.Role):
@@ -298,7 +303,7 @@ async def on_message(message: discord.Message):
                 arguments = words[1:]
                 if command == 'restart':
                     await message.channel.send("Restarting bot...")
-                    await client.get_channel(channels[guild.id]['admin']).send("FindBot Offline! Shutting down...")
+                    await shutdown_message()
                     dump_database_once()
                     await asyncio.sleep(1)
                     logger.info(f'Restarting bot...')
