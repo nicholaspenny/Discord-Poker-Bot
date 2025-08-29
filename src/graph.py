@@ -6,6 +6,8 @@ import re
 import sys
 from typing import Optional
 
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.ticker import AutoMinorLocator
 
@@ -22,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 def graph_setup(csv1: bytes, csv2: bytes) -> Optional[io.BytesIO]:
+    logger.info('Preparing CSVs For Graphing')
     try:
         csv_text_1 = csv1.decode('utf-8')
         csv_text_2 = csv2.decode('utf-8')
@@ -65,6 +68,7 @@ def graph(log: list[list[str]], ledger: list[list[str]]) -> io.BytesIO:
         stack_sizes[player] = [0.0]
 
     # Process of parsing through the log
+    logger.info('Starting Log Conversion')
     hand_number = 0
     line_number = 0
     for row in reversed(log):
@@ -155,38 +159,43 @@ def graph(log: list[list[str]], ledger: list[list[str]]) -> io.BytesIO:
         nets[player] = [x1 - x2 for (x1, x2) in zip(stack_sizes[player], buy_ins[player])]
 
     # Graphing with matplotlib
-    fig, ax = plt.subplots(figsize=(10, 6), dpi=450)
-    for user, values in nets.items():
-        numeric_values = values
-        ax.plot(numeric_values, label=user)
+    try:
+        fig, ax = plt.subplots(figsize=(10, 6), dpi=450)
+        for user, values in nets.items():
+            numeric_values = values
+            ax.plot(numeric_values, label=user)
 
-    ax.set_xlabel("Hand #")
-    ax.set_ylabel("Net $")
-    legend = ax.legend(title='PLAYERS', bbox_to_anchor=(1, 0.5), loc='center left', frameon=True)
-    legend.get_title().set_fontweight('bold')
-    legend.get_title().set_fontsize('large')
-    legend.get_frame().set_linewidth(1.5)
-    legend.get_frame().set_edgecolor('blue')
+        ax.set_xlabel("Hand #")
+        ax.set_ylabel("Net $")
+        legend = ax.legend(title='PLAYERS', bbox_to_anchor=(1, 0.5), loc='center left', frameon=True)
+        legend.get_title().set_fontweight('bold')
+        legend.get_title().set_fontsize('large')
+        legend.get_frame().set_linewidth(1.5)
+        legend.get_frame().set_edgecolor('blue')
 
-    ax.xaxis.set_minor_locator(AutoMinorLocator(5))
-    ax.yaxis.set_minor_locator(AutoMinorLocator(5))
-    ax.set_xlim(left=0)
-    ax.set_ylim(bottom=ax.get_ylim()[0], top=ax.get_ylim()[1])
-    ax.axhline(0, color='black', linewidth=0.5, linestyle='--')
-    ax.axhspan(ax.get_ylim()[0], 0, color='red', alpha=0.03, zorder=0)
-    ax.grid(True, linestyle='-', color='gray', alpha=0.5)
-    ax.grid(True, which='minor', linestyle=':', linewidth=0.5, color='gray', alpha=0.6)
+        ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+        ax.yaxis.set_minor_locator(AutoMinorLocator(5))
+        ax.set_xlim(left=0)
+        ax.set_ylim(bottom=ax.get_ylim()[0], top=ax.get_ylim()[1])
+        ax.axhline(0, color='black', linewidth=0.5, linestyle='--')
+        ax.axhspan(ax.get_ylim()[0], 0, color='red', alpha=0.03, zorder=0)
+        ax.grid(True, linestyle='-', color='gray', alpha=0.5)
+        ax.grid(True, which='minor', linestyle=':', linewidth=0.5, color='gray', alpha=0.6)
 
-    fig.tight_layout()
-    buffer = io.BytesIO()
-    fig.savefig(buffer, format='png')
-    buffer.seek(0)
-    return buffer
+        fig.tight_layout()
+        buffer = io.BytesIO()
+        fig.savefig(buffer, format='png')
+        plt.close('all')
+        buffer.seek(0)
+        return buffer
+    except Exception as err:
+        logger.exception('Error Plotting Graph')
 
 
 def update_names(dictionaries: dict[str, list[int]], players_dict: dict[str, str]) -> dict[str,list[int]]:
     # Searching user_ids to be replaced by the player's name when they exist in the database
     # Otherwise, replacing it with the alias used during the game when they do not exist in the database
+    logger.info('Updating Names for Graph')
     new_dictionaries = {}
     with connect() as connection:
         for player in dictionaries:
@@ -223,7 +232,7 @@ def main():
             with open(output_filename, "wb") as out_file:
                 out_file.write(result.getvalue())
         else:
-            print("Graph Setup Failed.")
+            logger.warning("Graph Setup Failed.")
     except FileNotFoundError as err:
         logger.critical('Incorrect or missing file path(s): %s', err, exc_info=True)
     except Exception as err:

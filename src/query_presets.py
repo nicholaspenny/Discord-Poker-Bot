@@ -99,7 +99,7 @@ def grapher(grapher_query, title='', *args):
     num_cols = (num_lines + MAX_PLAYERS_PER_COL - 1) // MAX_PLAYERS_PER_COL
     fig, ax = plt.subplots(figsize=(11 + num_cols * 1.5, 8))
     for player in wide.columns:
-        count = (df['name'] == player).sum()
+        count = df['name'].eq(player).sum()
         ax.plot(wide.index, wide[player], label=f'{player} - {count}')
     game_ids = wide.index.to_list()
     MAX_TICKS = 10
@@ -140,9 +140,13 @@ def grapher(grapher_query, title='', *args):
     buffer.seek(0)
     return buffer
 
-def recent_graph(days = 30) -> io.BytesIO:
+def recent_graph(days = 30, selected_players = None) -> io.BytesIO:
+    graph_query_mid = ''
+    params = []
+    if selected_players:
+        graph_query_mid = f"""WHERE name ILIKE ANY (%s)"""
+        params.append(selected_players)
     date_filter = f"g.date >= NOW() - INTERVAL '{days} days'"
-    recent_query_end = """ORDER BY name, game_id;"""
     recent_query = f"""
         WITH recent_games AS (
             SELECT p.name AS name,
@@ -159,6 +163,7 @@ def recent_graph(days = 30) -> io.BytesIO:
         active_players AS (
             SELECT DISTINCT name
             FROM recent_games
+            {graph_query_mid}
         )
         SELECT rg.name,
                rg.game_id,
@@ -170,14 +175,14 @@ def recent_graph(days = 30) -> io.BytesIO:
                ), 2) AS career
         FROM recent_games rg
         JOIN active_players ap ON rg.name = ap.name
-        {recent_query_end}
+        ORDER BY name, game_id;
     """
-    return grapher(recent_query, f'Last {days} Days')
+    return grapher(recent_query, f'Last {days} Days', *params)
 
 
 def career_graph(selected_players = None) -> io.BytesIO:
-    params = []
     graph_query_mid = ''
+    params = []
     if selected_players:
         graph_query_mid = f"""WHERE name ILIKE ANY (%s)"""
         params.append(selected_players)

@@ -16,5 +16,3 @@ def config(filename="db/database.ini", section="postgresql"):
         raise Exception(f'Section {section} is not found in the {filename} file.')
 
     return db
-
-
