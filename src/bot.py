@@ -42,11 +42,11 @@ channel_query = """SELECT channel_name, channel_id FROM channels;"""
 roles: dict[int: dict[str, int]] = {}
 role_query = """SELECT role_name, role_id FROM roles;"""
 
-CHANNELS_TEMPLATE = [
+CHANNELS_TEMPLATE = {
     'admin', 'commands', 'email', 'email-database', 'game', 'game-test', 'graph',
     'graph-test', 'ledgers', 'ledgers-test', 'manage', 'music', 'query', 'query-test', 'roles'
-]
-ROLES_TEMPLATE = ['star', 'admin', 'poker bot', 'email needed']
+}
+ROLES_TEMPLATE = {'star', 'admin', 'poker bot', 'email needed'}
 
 
 async def populate_dictionaries():
@@ -56,9 +56,9 @@ async def populate_dictionaries():
         for guild in client.guilds:
             guild_channels = [c for c in await guild.fetch_channels() if
                               isinstance(c, discord.TextChannel) and c.name in CHANNELS_TEMPLATE]
-            channels[guild.id] = {c.name: c.id for c in guild_channels}
+            channels[guild.id] = {c.name: c.id for c in sorted(guild_channels, key=lambda x: x.id)}
             guild_roles = [r for r in await guild.fetch_roles() if r.name in ROLES_TEMPLATE]
-            roles[guild.id] = {r.name: r.id for r in guild_roles}
+            roles[guild.id] = {r.name: r.id for r in sorted(guild_roles, key=lambda x: x.id)}
     except Exception as err:
         logger.warning('Using Default Dictionary Values: %s', err)
         # This is to default hard-code dictionaries in primary server for necessary channels/roles
@@ -283,7 +283,6 @@ async def on_message(message: discord.Message):
     global roles
 
     guild = message.guild
-    guild.id = guild.id
     if message.channel.id == channels[guild.id]['email']:
         email_database_channel = client.get_channel(channels[guild.id]['email-database'])
         # newest to oldest
@@ -297,18 +296,36 @@ async def on_message(message: discord.Message):
             return
         txt = message.content.strip()
         if txt and txt.startswith('!'):
-            words = txt[1:].lower().split()
+            words = txt[1:].split()
             if words:
-                command = words[0]
+                option = words[0].lower()
                 arguments = words[1:]
-                if command == 'restart':
+                if option == 'restart':
                     await message.channel.send("Restarting bot...")
-                    await shutdown_message()
-                    dump_database_once()
-                    await asyncio.sleep(1)
                     logger.info(f'Restarting bot...')
+                    await shutdown()
                     os.execv(sys.executable, [sys.executable] + sys.argv)
-                elif command == 'add_games':
+                elif option == 'setup':
+                    guild_channels = [c for c in await guild.fetch_channels() if
+                              isinstance(c, discord.TextChannel) and c.name in CHANNELS_TEMPLATE]
+                    guild_channel_names = [c.name for c in guild_channels]
+                    for channel in CHANNELS_TEMPLATE:
+                        if channel not in guild_channel_names:
+                            new_channel = await guild.create_text_channel(channel)
+                            perms = new_channel.permissions_for(guild.me)
+                            if not perms.read_messages:
+                                await new_channel.set_permissions(guild.me, read_messages=True, send_messages=True)
+                            channels[guild.id][channel] = new_channel.id
+                        else:
+                            duplicate_channels = [d for d in guild_channels if d.name == channel]
+                            for c in duplicate_channels:
+                                if c.id == channels[guild.id][channel]:
+                                    perms = c.permissions_for(guild.me)
+                                    if not perms.read_messages:
+                                        await c.set_permissions(guild.me, read_messages=True, send_messages=True)
+                                else:
+                                    await c.delete(reason=f'Removed Duplicate of #{channel}')
+                elif option == 'add_games':
                     # message: !add_games MM DD YYYY
                     if len(arguments) > 1:
                         m = int(arguments[0])
@@ -335,7 +352,7 @@ async def on_message(message: discord.Message):
                     else:
                         await message.channel.send('!add_games MM DD YYYY')
                         return
-                elif command == 'add_ledgers':
+                elif option == 'add_ledgers':
                     # message: !add_ledgers {game_id of 1st ledger} MM DD YYYY [MM DD YYY] <-- [optional end date]
                     if len(arguments) in (4 , 7):
                         logger.debug('Starting to Add Ledgers to Database')
@@ -379,8 +396,8 @@ async def on_message(message: discord.Message):
                 else:
                     channel_pattern = r"^<#(\d+)>$"
                     message_pattern = fr"^{re.escape(JUMP_URL_PREFIX)}{message.guild.id}/(\d+)/(\d+)$"
-                    channel_match = re.match(channel_pattern, command)
-                    message_match = re.match(message_pattern, command)
+                    channel_match = re.match(channel_pattern, option)
+                    message_match = re.match(message_pattern, option)
                     if channel_match:
                         # ! #channel [body] <-- [body is optional if attachments are included]
                         # group[1] == {channel_id where new message to be sent}
@@ -437,9 +454,9 @@ async def on_message(message: discord.Message):
         if txt and txt.startswith('!'):
             words = txt[1:].split()
             if words:
-                command = words[0]
+                option = words[0]
                 arguments = words[1:]
-                if command == 'table':
+                if option == 'table':
                     if arguments:
                         with connect() as connection:
                             table_query = f"""Select * from {arguments[0]}"""
@@ -449,78 +466,71 @@ async def on_message(message: discord.Message):
                             with pd.option_context('display.min_rows', 25, 'display.max_rows', 25):
                                 await message.channel.send(f'```{answer}```')
                         disconnect(connection)
-                        return
-                else:
-                    await message.channel.send('Unknown Command')
+                    else:
+                        await message.channel.send('!table requires 1 argument, the table name')
                     return
-
-                await message.channel.send('Missing/Invalid Arguments')
-            else:
-                await message.channel.send('!table, more commands soon')
+            await message.channel.send('!table, more commands soon')
         return
     elif message.channel.id in (channels[guild.id]['query'], channels[guild.id]['query-test']):
         if message.author == client.user:
             return
-        elif not message.content.strip().startswith('!'):
-            return
-        txt = message.content.strip()[1:]
-        if not txt or txt == 'help':
-            await message.channel.send("!leaderboard, !leaderboard_avg, !career, !graph, !players")
-        else:
-            option = txt.split()[0]
-            arguments = txt.split()[1:]
-            if option == 'players':
-                ans, columns = query_presets.players()
-                if ans:
-                    answer = pd.DataFrame(ans, columns=columns)
-                    answer.index += 1
-                    await message.channel.send(', '.join(answer['name'].to_list()))
-                else:
-                    await message.channel.send("!WTF")
+        txt = message.content.strip()
+        if txt and txt.startswith('!'):
+            words = txt[1:].split()
+            if words:
+                option = words[0].lower()
+                arguments = words[1:]
+                if option == 'players':
+                    ans, columns = query_presets.players()
+                    if ans:
+                        answer = pd.DataFrame(ans, columns=columns)
+                        answer.index += 1
+                        await message.channel.send(', '.join(answer['name'].to_list()))
+                    else:
+                        await message.channel.send("!WTF")
                     return
-            elif option in ('leaderboard', 'leaderboard_avg'):
-                ans, columns = query_presets.leaderboard(txt.split()[1:], option=='leaderboard_avg')
-                if ans:
-                    answer = pd.DataFrame(ans, columns=columns)
-                    answer.index += 1
-                    with pd.option_context('display.min_rows', 25, 'display.max_rows', 25):
-                        await message.channel.send(f'```{answer}```')
-                    return
-                else:
-                    await message.channel.send("!WTF")
-                    return
-            elif option == 'career':
-                if len(txt.split()) == 2:
-                    ans, columns = query_presets.career(txt.split()[1])
+                elif option in ('leaderboard', 'leaderboard_avg'):
+                    ans, columns = query_presets.leaderboard(txt.split()[1:], option == 'leaderboard_avg')
                     if ans:
                         answer = pd.DataFrame(ans, columns=columns)
                         answer.index += 1
                         with pd.option_context('display.min_rows', 25, 'display.max_rows', 25):
                             await message.channel.send(f'```{answer}```')
-                        return
-                await message.channel.send("!Include exactly 1 player name. !career name. !players.")
-                return
-            elif option == 'graph':
-                career_graph = query_presets.career_graph(arguments)
-                if career_graph:
-                    graph_file = discord.File(career_graph, filename='career_graph.png')
-                    await message.channel.send(file=graph_file)
-                else:
-                    await message.channel.send('Error or No Career Graph')
-                return
-            elif option == 'recent':
-                days = 30
-                if arguments and arguments[0].isdigit():
-                    days = arguments[0]
-                    arguments = arguments[1:]
-                recent_graph = query_presets.recent_graph(days, arguments)
-                if recent_graph:
-                    recent_file = discord.File(recent_graph, filename='recent_graph.png')
-                    await message.channel.send(file=recent_file)
-                else:
-                    await message.channel.send(f'No games in the last {days} days')
-                return
-            return
+                    else:
+                        await message.channel.send("!WTF")
+                    return
+                elif option == 'career':
+                    if len(txt.split()) == 2:
+                        ans, columns = query_presets.career(txt.split()[1])
+                        if ans:
+                            answer = pd.DataFrame(ans, columns=columns)
+                            answer.index += 1
+                            with pd.option_context('display.min_rows', 25, 'display.max_rows', 25):
+                                await message.channel.send(f'```{answer}```')
+                            return
+                    await message.channel.send("!Include exactly 1 player name. !career name. !players.")
+                    return
+                elif option == 'graph':
+                    career_graph = query_presets.career_graph(arguments)
+                    if career_graph:
+                        graph_file = discord.File(career_graph, filename='career_graph.png')
+                        await message.channel.send(file=graph_file)
+                    else:
+                        await message.channel.send('Error or No Career Graph')
+                    return
+                elif option == 'recent':
+                    days = 30
+                    if arguments and arguments[0].isdigit():
+                        days = arguments[0]
+                        arguments = arguments[1:]
+                    recent_graph = query_presets.recent_graph(days, arguments)
+                    if recent_graph:
+                        recent_file = discord.File(recent_graph, filename='recent_graph.png')
+                        await message.channel.send(file=recent_file)
+                    else:
+                        await message.channel.send(f'No games in the last {days} days')
+                    return
+            await message.channel.send("!leaderboard, !leaderboard_avg, !career, !graph, !recent, !players")
         return
     elif message.channel.id in (channels[guild.id]['ledgers'], channels[guild.id]['ledgers-test']):
         if message.author == client.user:
