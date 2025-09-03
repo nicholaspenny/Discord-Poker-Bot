@@ -306,7 +306,6 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             return
 
 
-
 @client.event
 async def on_ready():
     await populate_dictionaries()
@@ -327,7 +326,6 @@ async def prompt_for_input(message: discord.Message, prompt_text: str, timeout: 
     except asyncio.TimeoutError:
         await message.channel.send("No response received in time. Operation cancelled.")
         return None
-
 
 
 async def attachments_to_bytes(attachments_list: list[list[discord.Attachment]]) -> list[list[tuple[bytes, str]]]:
@@ -518,7 +516,7 @@ async def on_message(message: discord.Message):
                             logger.warning('Unbalanced Ledgers Sum: %s', ledgers_sum)
                         if new_users:
                             for user in new_users:
-                                await admin_message(guild, f"{user} - created:\n!reassign in <#{channels[guild.id]['database']} if necessary.")
+                                await admin_message(guild, f"{user} - created:\n!reassign in <#{channels[guild.id]['database']}> if necessary.")
                         await reset_database_sequences(guild)
                         return
                     else:

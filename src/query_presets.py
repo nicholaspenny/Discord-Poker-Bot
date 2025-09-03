@@ -112,6 +112,16 @@ def grapher(grapher_query, title='', *args):
     ax.grid(True, axis='x', which='major', linestyle='--')
     ax.grid(True, axis='y', which='major', linestyle='--')
 
+    previous_year = None
+    for game in wide.index:
+        date = date_map.get(game)
+        if date and (previous_year is None or date.year > previous_year):
+            ax.axvline(x=game, color='gray', linestyle='--', linewidth=1.5, zorder=0)
+            ax.text(game, ax.get_ylim()[1] * 0.975 + ax.get_ylim()[0] * 0.025, str(date.year),
+                    rotation=90, verticalalignment='top', horizontalalignment='left',
+                    color='gray', fontsize=30)
+            previous_year = date.year
+
     num_lines = len(wide.columns)
     num_cols = (num_lines + MAX_PLAYERS_PER_COL - 1) // MAX_PLAYERS_PER_COL
     legend = ax.legend(title='PLAYERS', ncol=num_cols, fontsize='medium', loc='center left', bbox_to_anchor=(1, .5))
