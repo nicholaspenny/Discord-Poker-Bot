@@ -369,7 +369,7 @@ async def game_jump(message: discord.Message) -> Optional[discord.Message]:
     return game_jump_message
 
 
-async def compose_game(message: discord.Message) -> Optional[str]:
+async def get_email(message: discord.Message) -> Optional[str]:
     email = None
     email_query = """SELECT email FROM players WHERE discord_id = %s;"""
     guild = message.guild
@@ -381,13 +381,15 @@ async def compose_game(message: discord.Message) -> Optional[str]:
         else:
             await admin_message(guild, f"{message.author.name} missing from database")
     except Exception as err:
-        await admin_message(guild, f"Failed to connect to database")
+        logger.exception('Failed to connect to database to fetch email: %s', err)
+        await admin_message(guild, "Failed to connect to database")
 
     email_database_channel = client.get_channel(channels[guild.id]['email-database'])
     # newest to oldest
     async for entry in email_database_channel.history():
         if message.author in entry.mentions:
-            if entry_email := [word for word in entry.content.split() if '@' in word and '<' not in word]:
+            entry_email = [word for word in entry.content.split() if '@' in word and '<' not in word]
+            if entry_email:
                 email = entry_email[0]
             break
     return email
@@ -882,19 +884,14 @@ async def on_message(message: discord.Message):
             return
         ping = f"<@&{roles[guild.id]['star']}>"
         link = [word for word in message.content.split() if POKERNOW in word][0]
-        email_database_channel = client.get_channel(channels[guild.id]['email-database'])
-        email = None
-        # newest to oldest
-        async for entry in email_database_channel.history():
-            if message.author in entry.mentions:
-                if email := [word for word in entry.content.split() if '@' in word and '<' not in word]:
-                    bot_link = await message.channel.send(f'{ping} {email[0]}\n{link}')
-                    await bot_link.create_thread(name="Notes", auto_archive_duration=1440)
-                    await message.delete()
-                    return
-                break
-        missing_email = f"Lobby creator must first register an email with the server." \
-                        f"\nAdd one to <#{channels[guild.id]['email']}> " \
+        email = await get_email(message)
+        if email:
+            bot_link = await message.channel.send(f'{ping} {email}\n{link}')
+            await bot_link.create_thread(name="Notes", auto_archive_duration=1440)
+            await message.delete()
+            return
+        missing_email = f"Lobby creator must first register an email with the server.\n" \
+                        f"Add one to <#{channels[guild.id]['email']}> " \
                         f"or contact an <@&{roles[guild.id]['admin']}> for access."
         await message.channel.send(missing_email)
         await message.delete()
