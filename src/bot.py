@@ -99,13 +99,14 @@ def reset_sequence(table: str, column: str) -> int:
         raise
 
 
-async def reset_database_sequences(guild: discord.Guild):
+async def reset_database_sequences(guild: discord.Guild = None):
     try:
         next_player = reset_sequence('players', 'player_id')
         next_game = reset_sequence('games', 'game_id')
     except Exception as err:
         logger.exception('Failed to reset database sequences: %s', err)
-        await admin_message(guild, 'Failed to reset database sequences')
+        if guild:
+            await admin_message(guild, 'Failed to reset database sequences')
     else:
         logger.info('Successfully reset database sequences')
         logger.info(f'Players - Next ID: {next_player}')
@@ -309,6 +310,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 @client.event
 async def on_ready():
     await populate_dictionaries()
+    await reset_database_sequences()
     logger.info('%s is now running!', client.user)
     for guild in client.guilds:
         await admin_message(guild, 'Poker Bot Online - At Your Service!')
