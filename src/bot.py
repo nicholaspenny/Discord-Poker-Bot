@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 import pandas as pd
 
 from src.config import config
-from src.connect import connect, disconnect, query
+from src.connect import connect, query
 from src import graph
 from src import ledger_gemini
 from src import query_presets
@@ -38,12 +38,9 @@ POKERNOW = 'https://www.pokernow.club/games/'
 JUMP_URL_PREFIX = 'https://discord.com/channels/'
 
 channels: dict[int: dict[str, int]] = {}
-channel_query = """SELECT channel_name, channel_id FROM channels;"""
 roles: dict[int: dict[str, int]] = {}
-role_query = """SELECT role_name, role_id FROM roles;"""
-
 CHANNELS_TEMPLATE = {
-    'admin', 'commands', 'email', 'email-database', 'game', 'game-test', 'graph',
+    'admin', 'commands', 'database', 'email', 'email-database', 'game', 'game-test', 'graph',
     'graph-test', 'ledgers', 'ledgers-test', 'manage', 'music', 'query', 'query-test', 'roles'
 }
 ROLES_TEMPLATE = {'star', 'admin', 'poker bot', 'email needed'}
@@ -56,9 +53,9 @@ async def populate_dictionaries():
         for guild in client.guilds:
             guild_channels = [c for c in await guild.fetch_channels() if
                               isinstance(c, discord.TextChannel) and c.name in CHANNELS_TEMPLATE]
-            channels[guild.id] = {c.name: c.id for c in sorted(guild_channels, key=lambda x: x.id)}
+            channels[guild.id] = {c.name: c.id for c in sorted(guild_channels, key=lambda x: x.created_at, reverse=True)}
             guild_roles = [r for r in await guild.fetch_roles() if r.name in ROLES_TEMPLATE]
-            roles[guild.id] = {r.name: r.id for r in sorted(guild_roles, key=lambda x: x.id)}
+            roles[guild.id] = {r.name: r.id for r in sorted(guild_roles, key=lambda x: x.created_at, reverse=True)}
     except Exception as err:
         logger.warning('Using Default Dictionary Values: %s', err)
         # This is to default hard-code dictionaries in primary server for necessary channels/roles
@@ -72,19 +69,8 @@ async def populate_dictionaries():
         channels = {1:
                         {'admin': 1,
                          'commands': 2,
-                         'email': 3,
-                         'email-database': 4,
-                         'game': 5,
-                         'game-test': 6,
-                         'graph': 7,
-                         'graph-test': 8,
-                         'ledgers': 9,
-                         'ledgers-test': 10,
-                         'manage': 11,
-                         'music': 12,
-                         'query': 13,
-                         'query-test': 14,
-                         'roles': 15,
+                         'database': 3,
+                         'manage': 4,
                          }
                     }
     finally:
@@ -96,48 +82,39 @@ async def populate_dictionaries():
                 mapping.setdefault(name, 0)
 
 
-async def attachments_to_bytes(attachments_list: list[list[discord.Attachment]]) -> list[list[tuple[bytes, str]]]:
-    images = []
+def reset_sequence(table: str, column: str) -> int:
+    reset_query = f"""SELECT setval(
+                                      pg_get_serial_sequence('{table}', '{column}'),
+                                      COALESCE((SELECT MAX({column}) FROM {table}), 0), -- max existing ID or 0 if empty
+                                      TRUE -- next nextval() will return max+1
+                              );"""
+    next_id_query = f"SELECT COALESCE(MAX({column}), 0) + 1 FROM {table};"
     try:
-        for sublist in attachments_list:
-            row = []
-            for attachment in sublist:
-                img_bytes = await attachment.read()
-                img_type = attachment.content_type
-                img_pair = (img_bytes, img_type)
-                row.append(img_pair)
-            images.append(row)
+        with connect() as connection:
+            query(connection, reset_query)
+            next_id, _ = query(connection, next_id_query)
+        return next_id
     except Exception as err:
-        logger.exception('Error Converting Attachments to Images: %s', err)
-        images = []
-
-    return images
+        logger.exception('Unable to Connect to the Database: %s', err)
+        raise
 
 
-async def game_jump(message: discord.Message) -> Optional[discord.Message]:
-    game_jump_message = None
-    given_link = [word for word in message.content.split() if JUMP_URL_PREFIX in word]
-    game_channel = client.get_channel(channels[message.guild.id]['game'])
-    if given_link:
-        # this is specifically fetching within #game
-        try:
-            msg = await game_channel.fetch_message(int(given_link[0].rpartition('/')[2]))
-            if POKERNOW in msg.content:
-                game_jump_message = msg
-        except Exception as err:
-            logger.warning('Message Not Found in #game: %s', err)
-            return None
+async def reset_database_sequences(guild: discord.Guild):
+    try:
+        next_player = reset_sequence('players', 'player_id')
+        next_game = reset_sequence('games', 'game_id')
+    except Exception as err:
+        logger.exception('Failed to reset database sequences: %s', err)
+        await admin_message(guild, 'Failed to reset database sequences')
     else:
-        async for entry in game_channel.history(limit=5):
-            if POKERNOW in entry.content:
-                game_jump_message = entry
-                break
-    return game_jump_message
+        logger.info('Successfully reset database sequences')
+        logger.info(f'Players - Next ID: {next_player}')
+        logger.info(f'Games - Next ID: {next_game}')
 
 
-def dump_database():
+def dump_database() -> Optional[str]:
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    dump_file = f"db/dump_{timestamp}.sql"
+    dump_path = f"db/dump_{timestamp}.sql"
     try:
         subprocess.run([
             "pg_dump",
@@ -149,63 +126,71 @@ def dump_database():
             "--no-owner",
             DATABASE_URL,
             "-f",
-            dump_file
+            dump_path
         ], check=True)
-        logger.info(f"Database dumped to {dump_file}")
+        logger.info(f"Database dumped to {dump_path}")
+        return dump_path
     except subprocess.CalledProcessError as e:
         logger.info(f"Database dump failed: {e}")
+        return None
 
 
-def dump_database_once():
+def dump_database_once() -> Optional[str]:
     global has_dumped
     if not has_dumped:
-        dump_database()
+        dump_path = dump_database()
         has_dumped = True
+        return dump_path
     else:
         logger.info('Database has already been dumped')
+        return None
 
 
-async def shutdown_message():
-    for guild in client.guilds:
-        channel = client.get_channel(channels[guild.id]['admin'])
-        if channel is not None:
-            await channel.send("FindBot Offline - Shutting down...")
+async def admin_message(guild: discord.Guild, content: str, file_path: str = None):
+    try:
+        admin_channel = guild.get_channel(channels[guild.id]['admin'])
+        if admin_channel:
+            if file_path:
+                attachment = discord.File(file_path, filename=file_path)
+                await admin_channel.send(content, file=attachment)
+            else:
+                await admin_channel.send(content)
         else:
-            logger.info("Channel not found in cache.")
+            logger.warning('Admin channel missing in %s', guild.name)
+    except Exception as err:
+        logger.exception('Failed to send admin message in %s: %s', guild.name, err)
+
+
+async def shutdown_message(file_path: Optional[str] = None):
+    for guild in client.guilds:
+        await admin_message(guild, "Poker Bot Offline - Shutting down...", file_path)
 
 
 async def shutdown():
     logger.info("Shutting down bot, dumping database if not already done...")
-    dump_database_once()
-    if not client.is_closed():
-        try:
-            await shutdown_message()
-        except Exception as e:
-            logger.warning(f"Failed to send shutdown message: {e}")
+    dump_path = dump_database_once()
+    try:
+        await shutdown_message(dump_path)
+    except Exception as e:
+        logger.warning(f"Failed to send shutdown message: {e}")
 
-    await client.close()
+    pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+    if not client.is_closed():
+        await client.close()
 
 
 def handle_signal(sig, _):
     # _ is a stand in for frame
     logger.info(f"Received signal {sig}, shutting down...")
-    asyncio.get_event_loop().create_task(shutdown())
+    asyncio.create_task(shutdown())
 
 
 signal.signal(signal.SIGINT, handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
-
-
-@client.event
-async def on_ready():
-    await populate_dictionaries()
-    logger.info('%s is now running!', client.user)
-    for guild in client.guilds:
-        admin_id = channels.get(guild.id, {}).get("admin")
-        if admin_id is not None:
-            channel = client.get_channel(admin_id)
-            if channel:
-                await channel.send('Poker Bot Online! At Your Service!')
 
 
 def update_guild_channel(
@@ -274,8 +259,138 @@ async def on_guild_role_delete(role: discord.Role):
 async def on_guild_join(guild: discord.Guild):
     await populate_dictionaries()
     logger.info('%s Just Joined %s', client.user, guild.name)
-    await client.get_channel(channels[guild.id]['admin']).send('Poker Bot Online! At Your Service!')
+    await admin_message(guild, 'Poker Bot Online - At Your Service!')
 
+
+@client.event
+async def on_member_join(member: discord.Member):
+    guild = member.guild
+    email_needed_role = guild.get_role(roles[guild.id]['email needed'])
+
+    if email_needed_role and not member.bot:
+        try:
+            await member.add_roles(email_needed_role)
+        except discord.Forbidden as err:
+            await admin_message(guild, 'Missing permissions to add roles')
+            logger.warning('Missing permissions to add role in %s', guild.name)
+        except Exception as err:
+            logger.exception('Failed to assign role in %s: %s', guild.name, err)
+    else:
+        logger.warning('Missing email needed role in %s:', guild.name)
+        await admin_message(guild, 'Please add a role named "email needed"')
+
+
+@client.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    added_roles = [r for r in after.roles if r not in before.roles]
+    guild = after.guild
+    email_needed_role = guild.get_role(roles[guild.id]['email needed'])
+    if email_needed_role in added_roles:
+        try:
+            with connect() as connection:
+                existing_player_query = """SELECT * FROM players WHERE discord_id = %s;"""
+                ans, cols = query(connection, existing_player_query, after.id)
+                if ans:
+                    logger.info('Member (%s) already exists in database. Removing email needed role.', ans)
+                    try:
+                        await after.remove_roles(email_needed_role)
+                    except discord.Forbidden as err:
+                        await admin_message(guild, 'Missing permissions to remove roles')
+                elif not after.bot:
+                    insert_player_query = """INSERT INTO players (name, discord_id)
+                                             VALUES (%s, %s) RETURNING player_id;"""
+                    ans2, cols2 = query(connection, insert_player_query, after.name, after.id)
+                    await admin_message(guild, f'{after.name} Inserted into Database - {ans2[0][0]}')
+        except Exception as err:
+            logger.exception('DB error checking existing player: %s', err)
+            return
+
+
+
+@client.event
+async def on_ready():
+    await populate_dictionaries()
+    logger.info('%s is now running!', client.user)
+    for guild in client.guilds:
+        await admin_message(guild, 'Poker Bot Online - At Your Service!')
+
+
+async def prompt_for_input(message: discord.Message, prompt_text: str, timeout: float = 60.0) -> Optional[str]:
+    await message.channel.send(prompt_text)
+
+    def check(m: discord.Message) -> bool:
+        return m.author == message.author and m.channel == message.channel
+
+    try:
+        reply = await client.wait_for('message', timeout=timeout, check=check)
+        return reply.content.strip()
+    except asyncio.TimeoutError:
+        await message.channel.send("No response received in time. Operation cancelled.")
+        return None
+
+
+
+async def attachments_to_bytes(attachments_list: list[list[discord.Attachment]]) -> list[list[tuple[bytes, str]]]:
+    images = []
+    try:
+        for sublist in attachments_list:
+            row = []
+            for attachment in sublist:
+                img_bytes = await attachment.read()
+                img_type = attachment.content_type
+                img_pair = (img_bytes, img_type)
+                row.append(img_pair)
+            images.append(row)
+    except Exception as err:
+        logger.exception('Error Converting Attachments to Images: %s', err)
+        images = []
+
+    return images
+
+
+async def game_jump(message: discord.Message) -> Optional[discord.Message]:
+    game_jump_message = None
+    given_link = [word for word in message.content.split() if JUMP_URL_PREFIX in word]
+    game_channel = client.get_channel(channels[message.guild.id]['game'])
+    if given_link:
+        # this is specifically fetching within #game
+        try:
+            msg = await game_channel.fetch_message(int(given_link[0].rpartition('/')[2]))
+            if POKERNOW in msg.content:
+                game_jump_message = msg
+        except Exception as err:
+            logger.warning('Message Not Found in #game: %s', err)
+            return None
+    else:
+        async for entry in game_channel.history(limit=5):
+            if POKERNOW in entry.content:
+                game_jump_message = entry
+                break
+    return game_jump_message
+
+
+async def compose_game(message: discord.Message) -> Optional[str]:
+    email = None
+    email_query = """SELECT email FROM players WHERE discord_id = %s;"""
+    guild = message.guild
+    try:
+        with connect() as connection:
+            ans, cols = query(connection, email_query, message.author.id)
+        if ans:
+            return ans[0][0]
+        else:
+            await admin_message(guild, f"{message.author.name} missing from database")
+    except Exception as err:
+        await admin_message(guild, f"Failed to connect to database")
+
+    email_database_channel = client.get_channel(channels[guild.id]['email-database'])
+    # newest to oldest
+    async for entry in email_database_channel.history():
+        if message.author in entry.mentions:
+            if entry_email := [word for word in entry.content.split() if '@' in word and '<' not in word]:
+                email = entry_email[0]
+            break
+    return email
 
 @client.event
 async def on_message(message: discord.Message):
@@ -302,7 +417,7 @@ async def on_message(message: discord.Message):
                 arguments = words[1:]
                 if option == 'restart':
                     await message.channel.send("Restarting bot...")
-                    logger.info(f'Restarting bot...')
+                    logger.info('Restarting bot...')
                     await shutdown()
                     os.execv(sys.executable, [sys.executable] + sys.argv)
                 elif option == 'setup':
@@ -311,7 +426,7 @@ async def on_message(message: discord.Message):
                     guild_channel_names = [c.name for c in guild_channels]
                     for channel in CHANNELS_TEMPLATE:
                         if channel not in guild_channel_names:
-                            new_channel = await guild.create_text_channel(channel)
+                            new_channel = await guild.create_text_channel(name=channel, reason="Setup missing channel")
                             perms = new_channel.permissions_for(guild.me)
                             if not perms.read_messages:
                                 await new_channel.set_permissions(guild.me, read_messages=True, send_messages=True)
@@ -325,6 +440,19 @@ async def on_message(message: discord.Message):
                                         await c.set_permissions(guild.me, read_messages=True, send_messages=True)
                                 else:
                                     await c.delete(reason=f'Removed Duplicate of #{channel}')
+
+                    guild_roles = [r for r in await guild.fetch_roles() if r.name in ROLES_TEMPLATE]
+                    guild_role_names = [r.name for r in guild_roles]
+
+                    for role in ROLES_TEMPLATE:
+                        if role not in guild_role_names:
+                            new_role = await guild.create_role(name=role, reason="Setup missing role")
+                            roles[guild.id][role] = new_role.id
+                        else:
+                            duplicate_roles = [d for d in guild_roles if d.name == role]
+                            for r in duplicate_roles:
+                                if not r.id == roles[guild.id][role]:
+                                    await r.delete(reason=f"Removed Duplicate of @'{role}'")
                 elif option == 'add_games':
                     # message: !add_games MM DD YYYY
                     if len(arguments) > 1:
@@ -345,7 +473,6 @@ async def on_message(message: discord.Message):
                                 for item in links:
                                     # unique part of pokernow url
                                     query(connection, game_query, item[0].split()[-1].rpartition('/')[2], item[-1])
-                            disconnect(connection)
                         except Exception as err:
                             logger.warning('No Games Inserted: %s', err)
                         return
@@ -368,7 +495,7 @@ async def on_message(message: discord.Message):
                         )
                         i = 0
                         attachments_list = []
-                        buffer = None
+                        buffer = datetime.datetime.min
                         ledgers_channel = client.get_channel(channels[guild.id]['ledgers'])
                         # oldest to newest
                         async for entry in ledgers_channel.history(after=after, before=before):
@@ -383,19 +510,23 @@ async def on_message(message: discord.Message):
                         results = []
                         for index, sublist in enumerate(images_list):
                             results.append(await asyncio.to_thread(ledger_gemini.gemini, sublist, game_id=game_id + index))
-                        ledgers_sum = ledger_gemini.insert_ledgers(ledger_gemini.format_ledgers(results), game_id=game_id)
+                        ledgers_sum, new_users = ledger_gemini.insert_ledgers(ledger_gemini.format_ledgers(results), game_id=game_id)
                         logger.info('%s Ledgers Inserted', len(images_list))
                         dump_database()
                         if ledgers_sum:
                             await message.channel.send(f'Unbalanced Ledgers Sum: {ledgers_sum}')
                             logger.warning('Unbalanced Ledgers Sum: %s', ledgers_sum)
+                        if new_users:
+                            for user in new_users:
+                                await admin_message(guild, f"{user} - created:\n!reassign in <#{channels[guild.id]['database']} if necessary.")
+                        await reset_database_sequences(guild)
                         return
                     else:
                         await message.channel.send('!add_ledgers GID MM DD YYYY')
                         return
                 else:
                     channel_pattern = r"^<#(\d+)>$"
-                    message_pattern = fr"^{re.escape(JUMP_URL_PREFIX)}{message.guild.id}/(\d+)/(\d+)$"
+                    message_pattern = fr"^{re.escape(JUMP_URL_PREFIX)}{guild.id}/(\d+)/(\d+)$"
                     channel_match = re.match(channel_pattern, option)
                     message_match = re.match(message_pattern, option)
                     if channel_match:
@@ -447,6 +578,101 @@ async def on_message(message: discord.Message):
                 await message.channel.send('!add_games, !add_ledgers, ![#channel] <- compose, ![message link] <- edit')
                 return
         return
+    elif message.channel.id == channels[guild.id]['database']:
+        if message.author == client.user:
+            return
+        txt = message.content.strip()
+        if txt and txt.startswith('!'):
+            words = txt[1:].split()
+            if words:
+                option = words[0].lower()
+                arguments = words[1:]
+                if option == 'reset':
+                    await reset_database_sequences(guild)
+                    return
+                elif option == 'delete':
+                    response = await prompt_for_input(
+                        message,
+                        "Enter: [table] [id] (e.g., 'players 115' or 'games 72'). You have 1 minute."
+                    )
+                    if response is None:
+                        await message.channel.send('Too late!')
+                        return
+
+                    parts = response.split()
+                    if len(parts) != 2:
+                        await message.channel.send("Invalid format. Operation cancelled.")
+                        return
+
+                    table, id_str = parts
+                    table = table.lower()
+                    table_keys = {'players': 'player_id', 'users': 'player_id', 'ledgers': 'game_id', 'games': 'game_id'}
+                    if table not in table_keys or not id_str.isdigit():
+                        await message.channel.send("Invalid table or ID. Operation cancelled.")
+                        return
+
+                    id_value = int(id_str)
+                    delete_query = f"""DELETE FROM {table} WHERE {table_keys[table]} = %s"""
+
+                    try:
+                        with connect() as connection:
+                            query(connection, delete_query, id_value)
+                    except Exception as err:
+                        await message.channel.send(f'An error occurred: {err}')
+                    else:
+                        await message.channel.send(f"Deleted {table} entry {id_value} successfully.")
+                    await reset_database_sequences(guild)
+                    return
+                elif option == 'reassign':
+                    response = await prompt_for_input(
+                        message,
+                        "Enter: [wrong_player_id] [correct_player_name] (e.g. '151 Bob'). You have 1 minute."
+                    )
+                    if response is None:
+                        await message.channel.send('Too late!')
+                        return
+
+                    parts = response.split(maxsplit=1)
+                    if len(parts) != 2 or not parts[0].isdigit():
+                        await message.channel.send("Invalid format. Operation cancelled.")
+                        return
+
+                    incorrect_id = int(parts[0])
+                    correct_name = parts[1].strip()
+
+                    try:
+                        with connect() as connection:
+                            result = query(connection, "SELECT player_id FROM players WHERE name = %s", correct_name)
+                            if not result:
+                                await message.channel.send(f"No player found with name '{correct_name}'.")
+                                return
+                            correct_id = result[0][0]
+
+                            if correct_id == incorrect_id:
+                                await message.channel.send(
+                                    "Correct and incorrect player IDs are the same. Operation cancelled.")
+                                return
+                            query(
+                                connection,
+                                "UPDATE users SET player_id = %s WHERE player_id = %s",
+                                correct_id, incorrect_id
+                            )
+                            query(
+                                connection,
+                                "DELETE FROM players WHERE player_id = %s",
+                                incorrect_id
+                            )
+                    except Exception as err:
+                        await message.channel.send(f'An error occurred: {err}')
+                    else:
+                        await message.channel.send(
+                            f"Reassigned users from player {incorrect_id} to {correct_name} (ID {correct_id}) "
+                            f"and deleted player {incorrect_id}."
+                        )
+                    await reset_database_sequences(guild)
+                    return
+            await message.channel.send('!delete, !reassign, !reset, more commands soon')
+            return
     elif message.channel.id == channels[guild.id]['commands']:
         if message.author == client.user:
             return
@@ -454,18 +680,26 @@ async def on_message(message: discord.Message):
         if txt and txt.startswith('!'):
             words = txt[1:].split()
             if words:
-                option = words[0]
+                option = words[0].lower()
                 arguments = words[1:]
                 if option == 'table':
                     if arguments:
-                        with connect() as connection:
-                            table_query = f"""Select * from {arguments[0]}"""
-                            ans, cols = query(connection, table_query)
-                            answer = pd.DataFrame(ans, columns=cols)
-                            answer.index += 1
-                            with pd.option_context('display.min_rows', 25, 'display.max_rows', 25):
-                                await message.channel.send(f'```{answer}```')
-                        disconnect(connection)
+                        try:
+                            with connect() as connection:
+                                table_query = f"""Select * from {arguments[0]}"""
+                                if arguments[1:]:
+                                    orders = ', '.join(f"{col} DESC" for col in arguments[1:])
+                                    table_query += f' ORDER BY {orders}'
+
+                                table_query += ';'
+                                ans, cols = query(connection, table_query)
+                                answer = pd.DataFrame(ans, columns=cols)
+                                answer.index += 1
+                                with pd.option_context('display.min_rows', 25, 'display.max_rows', 25):
+                                    await message.channel.send(f'```{answer}```')
+                        except Exception as err:
+                            logger.exception('Unable to Connect to the Database: %s', err)
+                            await message.channel.send('Unable to Connect to the Database')
                     else:
                         await message.channel.send('!table requires 1 argument, the table name')
                     return
@@ -560,7 +794,6 @@ async def on_message(message: discord.Message):
             try:
                 with connect() as connection:
                     ans, columns = query(connection, game_query, url, game_jump_message.created_at)
-                disconnect(connection)
             except Exception as err:
                 logger.warning('Unable to Insert Game: %s\nurl = %s', err, url)
 
@@ -569,12 +802,16 @@ async def on_message(message: discord.Message):
                 results = []
                 for sublist in images_list:
                     results.append(await asyncio.to_thread(ledger_gemini.gemini, sublist, game_id=ans[0][0]))
-                ledgers_sum = ledger_gemini.insert_ledgers(ledger_gemini.format_ledgers(results), game_id=ans[0][0])
+                ledgers_sum, new_users = ledger_gemini.insert_ledgers(ledger_gemini.format_ledgers(results), game_id=ans[0][0])
                 logger.info('%s Ledger(s) Inserted', len(images_list))
                 dump_database()
                 if ledgers_sum:
                     await message.channel.send(f'Unbalanced Ledgers Sum: {ledgers_sum}')
                     logger.warning('Unbalanced Ledgers Sum: %s', ledgers_sum)
+                if new_users:
+                    for user in new_users:
+                        await admin_message(guild, f"{user} - created:\n!reassign in <#{channels[guild.id]['database']}> if necessary.")
+                await reset_database_sequences(guild)
             else:
                 logger.info('Ledgers Skipped, Game Already Exists')
         return
@@ -622,7 +859,10 @@ async def on_message(message: discord.Message):
         member_email = message.content.split()[1]
 
         email_needed_role = guild.get_role(roles[guild.id]['email needed'])
-        await member.remove_roles(email_needed_role)
+        try:
+            await member.remove_roles(email_needed_role)
+        except discord.Forbidden as err:
+            await admin_message(guild, 'Missing permissions to remove roles')
 
         insert_player_query = """INSERT INTO players (name, discord_id, email) 
                                         VALUES (%s, %s, %s)
@@ -631,7 +871,6 @@ async def on_message(message: discord.Message):
         try:
             with connect() as connection:
                 query(connection, insert_player_query, member_name ,member_id, member_email, member_email, member_id)
-            disconnect(connection)
             dump_database()
         except Exception as err:
             logger.exception('Unable to Update Player Email: %s', err)
@@ -649,7 +888,7 @@ async def on_message(message: discord.Message):
         async for entry in email_database_channel.history():
             if message.author in entry.mentions:
                 if email := [word for word in entry.content.split() if '@' in word and '<' not in word]:
-                    bot_link = await message.channel.send(f'{ping} {email[0]} \n{link}')
+                    bot_link = await message.channel.send(f'{ping} {email[0]}\n{link}')
                     await bot_link.create_thread(name="Notes", auto_archive_duration=1440)
                     await message.delete()
                     return
