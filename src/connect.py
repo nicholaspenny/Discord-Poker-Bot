@@ -19,6 +19,7 @@ def connect():
 
 
 def query(connection, command: str, *args):
+    cursor = None
     try:
         cursor = connection.cursor()
         cursor.execute(command, args)
@@ -29,17 +30,11 @@ def query(connection, command: str, *args):
         else:
             value = []
             columns = None
-        cursor.close()
+
+        return value, columns
     except Exception as err:
         logger.exception('Unable to Complete Database Query: %s\nQuery: %s', err, command)
-        value = []
-        columns = None
-    return value, columns
-
-
-def disconnect(connection):
-    if connection is not None:
-        try:
-            connection.close()
-        except Exception as err:
-            logger.exception('Unable to Disconnect from the Database: %s', err)
+        raise
+    finally:
+        if cursor:
+            cursor.close()

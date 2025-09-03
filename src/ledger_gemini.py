@@ -10,7 +10,7 @@ from google import genai
 import pandas as pd
 from rapidfuzz import fuzz, process
 
-from src.connect import connect, disconnect, query
+from src.connect import connect, query
 
 load_dotenv()
 
@@ -82,7 +82,6 @@ def format_ledgers(data: list[pd.DataFrame]) -> list[pd.DataFrame]:
         user_query = """SELECT user_id FROM users;"""
         with connect() as connection:
             ans, cols = query(connection, user_query)
-        disconnect(connection)
     except Exception as e:
         logger.warning('Unable to Access Users from Database: %s', e)
     else:
@@ -101,7 +100,7 @@ def format_ledgers(data: list[pd.DataFrame]) -> list[pd.DataFrame]:
     return data
 
 
-def insert_ledgers(results: list[pd.DataFrame], game_id: int):
+def insert_ledgers(results: list[pd.DataFrame], game_id: int) -> tuple[int, list[tuple[int, str, str, int]]]:
     if results:
         logger.info('Ledgers Completed')
         game_query = """INSERT INTO games (game_id, url, date) VALUES (%s, %s, CURRENT_DATE) 
@@ -114,6 +113,7 @@ def insert_ledgers(results: list[pd.DataFrame], game_id: int):
                         VALUES (%s, %s, %s, %s)
                         ON CONFLICT (game_id, user_id) DO NOTHING;"""
         sum_query = """SELECT SUM(net) FROM ledgers"""
+        new_users = []
         try:
             with connect() as connection:
                 # [alias, user_id, net]
@@ -126,10 +126,10 @@ def insert_ledgers(results: list[pd.DataFrame], game_id: int):
                             if not ans1:
                                 ans2, cols2 = query(connection, create_player_query, row.alias)
                                 query(connection, create_user_query, ans2[0], row.user_id)
+                                new_users.append((ans2[0], row.alias, row.user_id, row.net))
                             query(connection, ledger_query, game_id, row.user_id, row.net, row.alias)
                         logger.info('Inserting at %s', game_id)
                     game_id += 1
-            disconnect(connection)
         except Exception as e:
             logger.error('Unable to Insert Ledgers: %s', e)
 
@@ -137,14 +137,13 @@ def insert_ledgers(results: list[pd.DataFrame], game_id: int):
             with connect() as connection:
                 ledgers_sum, _ = query(connection, sum_query)
                 ledgers_sum = ledgers_sum[0][0]
-            disconnect(connection)
         except Exception as e:
             logger.warning('Unable to Retrieve Sum of Ledgers: %s', e)
             ledgers_sum = 0
 
-        return ledgers_sum
+        return ledgers_sum, new_users
     else:
-        return -1
+        return -1, []
 
 def spinner():
     global done
@@ -181,7 +180,7 @@ def main():
     t.join()
 
     if game_id is not None:
-        ledgers_sum = insert_ledgers(format_ledgers([response]), game_id)
+        ledgers_sum, new_users = insert_ledgers(format_ledgers([response]), game_id)
         if ledgers_sum:
             print(ledgers_sum)
     else:

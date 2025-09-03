@@ -11,7 +11,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.ticker import AutoMinorLocator
 
-from src.connect import connect, disconnect, query
+from src.connect import connect, query
 
 COLORS = [
     "Blue", "Red", "Lime", "Magenta", "Orange", "SaddleBrown", "Cyan",
@@ -211,7 +211,6 @@ def update_names(dictionaries: dict[str, list[int]], players_dict: dict[str, str
                     new_dictionaries[name] = dictionaries[player]
             else:
                 new_dictionaries[players_dict[player]+'*'] = dictionaries[player]
-    disconnect(connection)
     return new_dictionaries
 
 

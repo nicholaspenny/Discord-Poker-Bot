@@ -1,11 +1,13 @@
 import io
 import logging
 
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.ticker import AutoMinorLocator
 import pandas as pd
 
-from src.connect import connect, disconnect, query
+from src.connect import connect, query
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +16,6 @@ def players():
     players_query = """SELECT name from players Order By name;"""
     with connect() as connection:
         a, c = query(connection, players_query)
-    disconnect(connection)
     return a, c
 
 
@@ -43,7 +44,6 @@ def leaderboard(names = None, order_avg=False):
         """
     with connect() as connection:
         a, c = query(connection, leaderboard_query, params)
-    disconnect(connection)
     return a, c
 
 
@@ -63,7 +63,6 @@ def career(name = None):
     if name:
         with connect() as connection:
             a, c = query(connection, career_query,f'%{name}%')
-        disconnect(connection)
         return a, c
     else:
         return [], None
@@ -76,7 +75,6 @@ def grapher(grapher_query, title='', *args):
         df = pd.DataFrame(ans, columns=columns)
         ans2, columns2 = query(connection, games_query)
         date_map = pd.DataFrame(ans2, columns=columns2).set_index("game_id")["date"]
-    disconnect(connection)
 
     if df.empty:
         return None
