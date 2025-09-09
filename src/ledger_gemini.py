@@ -100,7 +100,7 @@ def format_ledgers(data: list[pd.DataFrame]) -> list[pd.DataFrame]:
     return data
 
 
-def insert_ledgers(results: list[pd.DataFrame], game_id: int) -> tuple[int, list[tuple[int, str, str, int]]]:
+def insert_ledgers(results: list[pd.DataFrame], game_id: int) -> tuple[int, list[str]]:
     if results:
         logger.info('Ledgers Completed')
         game_query = """INSERT INTO games (game_id, url, date) VALUES (%s, %s, CURRENT_DATE) 
@@ -126,7 +126,7 @@ def insert_ledgers(results: list[pd.DataFrame], game_id: int) -> tuple[int, list
                             if not ans1:
                                 ans2, cols2 = query(connection, create_player_query, row.alias)
                                 query(connection, create_user_query, ans2[0], row.user_id)
-                                new_users.append((ans2[0], row.alias, row.user_id, row.net))
+                                new_users.append(f'{ans2[0]}: {row.alias} ({row.user_id})')
                             query(connection, ledger_query, game_id, row.user_id, row.net, row.alias)
                         logger.info('Inserting at %s', game_id)
                     game_id += 1
