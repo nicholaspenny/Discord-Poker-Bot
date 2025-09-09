@@ -231,15 +231,11 @@ class OnMessageHandler:
             logger.warning('Missing permissions to add role in %s', guild.name)
             await self.admin_message(guild, 'Missing permissions to remove roles')
 
-        insert_player_query = """INSERT INTO players (name, discord_id, email)
-                                 VALUES (%s, %s, %s)
-                                 ON CONFLICT ON CONSTRAINT players_discord_id_key DO NOTHING;
-        UPDATE players \
-        SET email = %s \
-        WHERE discord_id = %s;"""
+        insert_player_query = """INSERT INTO players (name, discord_id, email) VALUES (%s, %s, %s)
+                                 ON CONFLICT (discord_id) DO UPDATE SET email = EXCLUDED.email;"""
         try:
             with connect() as connection:
-                query(connection, insert_player_query, member_name, member_id, member_email, member_email, member_id)
+                query(connection, insert_player_query, member_name, member_id, member_email)
             self.dump()
         except Exception as err:
             logger.exception('Unable to Update Player Email: %s', err)
@@ -249,7 +245,7 @@ class OnMessageHandler:
         if not POKERNOW in message.content:
             return
         guild = message.guild
-        ping = f"<@&{roles[guild.id]['fiend']}>"
+        ping = f"<@&{roles[guild.id]['star']}>"
         link = [word for word in message.content.split() if POKERNOW in word][0]
         email = await self._get_email(message)
         if email:
@@ -327,23 +323,24 @@ class OnMessageHandler:
                     return
             words_with_url = [word for word in game_jump_message.content.split() if POKERNOW in word]
             url = words_with_url[0].rpartition('/')[2]
-            game_query = """INSERT INTO games (url, date) \
-                            VALUES (%s, %s)
-                            ON CONFLICT (url) DO NOTHING \
-                            RETURNING game_id;"""
+            game_query = """INSERT INTO games (url, date) VALUES (%s, %s)
+                            ON CONFLICT (url) DO NOTHING RETURNING game_id;"""
+            game_id_query = """SELECT game_id, date FROM games WHERE url = %s;"""
             try:
                 with connect() as connection:
                     ans, columns = query(connection, game_query, url, game_jump_message.created_at)
+                    ans2, columns2 = query(connection, game_id_query, url)
             except Exception as err:
                 logger.warning('Unable to Insert Game: %s\nurl = %s', err, url)
 
-            if ans:
+            if ans or ans2:
+                game_id = ans[0][0] if ans else ans2[0][0]
                 images_list = await attachments_to_bytes([attachments])
                 results = []
                 for sublist in images_list:
-                    results.append(await asyncio.to_thread(ledger_gemini.gemini, sublist, game_id=ans[0][0]))
+                    results.append(await asyncio.to_thread(ledger_gemini.gemini, sublist, game_id=game_id))
                 ledgers_sum, new_users = ledger_gemini.insert_ledgers(ledger_gemini.format_ledgers(results),
-                                                                      game_id=ans[0][0])
+                                                                      game_id=game_id)
                 logger.info('%s Ledger(s) Inserted', len(images_list))
                 await self._after_insert(guild, ledgers_sum, new_users)
                 return
@@ -465,8 +462,7 @@ class OnMessageHandler:
                         d = int(arguments[1])
                         y = int(arguments[2])
                         logger.debug('Starting to Add Games to Database')
-                        game_query = """INSERT INTO games (url, date) \
-                                        VALUES (%s, %s);"""
+                        game_query = """INSERT INTO games (url, date) VALUES (%s, %s);"""
                         links = []
                         game_channel = guild.get_channel(channels[guild.id]['game'])
                         # oldest to newest
