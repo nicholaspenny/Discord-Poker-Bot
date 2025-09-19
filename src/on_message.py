@@ -22,8 +22,11 @@ JUMP_URL_PREFIX = 'https://discord.com/channels/'
 
 channels = common.channels
 roles = common.roles
+TABLES = common.TABLES
 CHANNELS_TEMPLATE = common.CHANNELS_TEMPLATE
 ROLES_TEMPLATE = common.ROLES_TEMPLATE
+
+_IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
 
 async def game_jump(message: discord.Message) -> Optional[discord.Message]:
@@ -77,36 +80,8 @@ class OnMessageHandler:
         # currently admin is just logs, might add functionality later
         return
 
-    @staticmethod
-    async def handle_commands(message: discord.Message):
-        txt = message.content.strip()
-        if txt and txt.startswith('!'):
-            words = txt[1:].split()
-            if words:
-                option = words[0].lower()
-                arguments = words[1:]
-                if option == 'table':
-                    if arguments:
-                        try:
-                            with connect() as connection:
-                                table_query = f"""Select * from {arguments[0]}"""
-                                if arguments[1:]:
-                                    orders = ', '.join(f"{col} DESC" for col in arguments[1:])
-                                    table_query += f' ORDER BY {orders}'
-
-                                table_query += ';'
-                                ans, cols = query(connection, table_query)
-                                answer = pd.DataFrame(ans, columns=cols)
-                                answer.index += 1
-                                with pd.option_context('display.min_rows', 25, 'display.max_rows', 25):
-                                    await message.channel.send(f'```{answer}```')
-                        except Exception as err:
-                            logger.exception('Unable to Connect to the Database: %s', err)
-                            await message.channel.send('Unable to Connect to the Database')
-                    else:
-                        await message.channel.send('!table requires 1 argument, the table name')
-                    return
-            await message.channel.send('!table, more commands soon')
+    async def handle_commands(self, message: discord.Message):
+        # for future implementation of commands
         return
 
     async def handle_database(self, message: discord.Message):
@@ -136,13 +111,12 @@ class OnMessageHandler:
 
                     table, id_str = parts
                     table = table.lower()
-                    table_keys = {'players': 'player_id', 'users': 'player_id', 'ledgers': 'game_id', 'games': 'game_id'}
-                    if table not in table_keys or not id_str.isdigit():
+                    if table not in TABLES or not id_str.isdigit():
                         await message.channel.send("Invalid table or ID. Operation cancelled.")
                         return
 
                     id_value = int(id_str)
-                    delete_query = f"""DELETE FROM {table} WHERE {table_keys[table]} = %s"""
+                    delete_query = f"""DELETE FROM {table} WHERE {TABLES[table]} = %s"""
 
                     try:
                         with connect() as connection:
@@ -157,53 +131,155 @@ class OnMessageHandler:
                 elif option == 'reassign':
                     response = await self.prompt(
                         message,
-                        "Enter: [wrong_player_id] [correct_player_name] (e.g. '151 Bob'). You have 1 minute."
+                        "Enter: [wrong_player_id] [correct_player_id] {correct_user_id} (e.g. '151 108 a1b2c3d4e5'). You have 1 minute."
                     )
                     if response is None:
                         await message.channel.send('Too late!')
                         return
 
-                    parts = response.split(maxsplit=1)
-                    if len(parts) != 2 or not parts[0].isdigit():
+                    parts = response.split()
+                    if len(parts) not in [2, 3] or not parts[0].isdigit() or not parts[1].isdigit():
                         await message.channel.send("Invalid format. Operation cancelled.")
                         return
 
-                    incorrect_id = int(parts[0])
-                    correct_name = parts[1].strip()
+                    incorrect_player_id = int(parts[0])
+                    correct_player_id = int(parts[1])
+                    correct_user_id = parts[2] if len(parts) == 3 else None
+
+                    user_id_text = ''
+                    if correct_user_id:
+                        user_id_text = f' ({correct_user_id} - updated)'
+                    response = await self.prompt(
+                        message,
+                        f"Respond 'OK' to reassign player {incorrect_player_id} -> {correct_player_id}{user_id_text}"
+                    )
+                    if response is None or response.lower() != 'ok':
+                        raise RuntimeError("User cancelled the operation — rolling back.")
 
                     try:
                         with connect() as connection:
-                            result = query(connection, "SELECT player_id FROM players WHERE name = %s", correct_name)
-                            if not result:
-                                await message.channel.send(f"No player found with name '{correct_name}'.")
-                                return
-                            correct_id = result[0][0]
-
-                            if correct_id == incorrect_id:
-                                await message.channel.send(
-                                    "Correct and incorrect player IDs are the same. Operation cancelled.")
-                                return
-                            query(
-                                connection,
-                                "UPDATE users SET player_id = %s WHERE player_id = %s",
-                                correct_id, incorrect_id
-                            )
-                            query(
-                                connection,
-                                "DELETE FROM players WHERE player_id = %s",
-                                incorrect_id
-                            )
+                            if correct_user_id:
+                                row = query(connection, "SELECT 1 FROM users WHERE user_id = %s", correct_user_id)
+                                if not row:
+                                    query(
+                                        connection,
+                                        "INSERT INTO users (user_id, player_id) VALUES (%s, %s)",
+                                        correct_user_id, correct_player_id
+                                    )
+                                query(
+                                    connection,
+                                    "UPDATE ledgers SET user_id = %s WHERE user_id IN "
+                                    "(SELECT user_id FROM users WHERE player_id = %s)",
+                                    correct_user_id, incorrect_player_id
+                                )
+                                query(
+                                    connection,
+                                    "DELETE FROM users WHERE player_id = %s and user_id != %s",
+                                    incorrect_player_id, correct_user_id
+                                )
+                            else:
+                                query(
+                                    connection,
+                                    "UPDATE users SET player_id = %s WHERE player_id = %s",
+                                    correct_player_id, incorrect_player_id
+                                )
+                            if correct_player_id != incorrect_player_id:
+                                query(
+                                    connection,
+                                    "DELETE FROM players WHERE player_id = %s ",
+                                    incorrect_player_id
+                                )
+                    except RuntimeError:
+                        logger.info('Player Reassignment Cancelled')
+                        await message.channel.send(f'Player Reassignment Cancelled')
                     except Exception as err:
                         logger.exception('Error reassigning database entry: %s', err)
                         await message.channel.send(f'An error occurred: {err}')
                     else:
-                        await message.channel.send(
-                            f"Reassigned users from player {incorrect_id} to {correct_name} (ID {correct_id}) "
-                            f"and deleted player {incorrect_id}."
-                        )
+                        await message.channel.send('Player Reassignment Successful.')
                     await self.reset_sequences(guild)
                     return
-            await message.channel.send('!delete, !reassign, !reset, more commands soon')
+                elif option == 'table':
+                    if not arguments:
+                        await message.channel.send('!table requires 1 argument, the table name')
+                        return
+
+                    table = arguments[0].lower()
+                    if table not in TABLES or not _IDENTIFIER_RE.fullmatch(table):
+                        await message.channel.send(f'Table: {table} - does not exist')
+                        return
+                    safe_table = f'"{table}"'
+
+                    try:
+                        with connect() as connection:
+                            ans, columns = query(connection,
+                                                    "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+                                                    table)
+                            table_columns = [c[0].lower() for c in ans]
+                            table_query = f"""Select * FROM {safe_table} ORDER BY """
+                            if arguments[1:]:
+                                for col in arguments[1:]:
+                                    if col not in table_columns or not _IDENTIFIER_RE.fullmatch(col):
+                                        await message.channel.send(f'Column: {col} - not in {table}')
+                                        return
+                                table_query += ', '.join(f'"{col}" DESC' for col in arguments[1:])
+                            else:
+                                table_query += f'"{TABLES[table]}" DESC'
+
+                            table_query += ';'
+                            ans, cols = query(connection, table_query)
+                            answer = pd.DataFrame(ans, columns=cols)
+                            answer.index += 1
+                            with pd.option_context('display.min_rows', 25, 'display.max_rows', 25):
+                                await message.channel.send(f'```{answer}```')
+                    except Exception as err:
+                        logger.exception('Unable to Connect to the Database: %s', err)
+                        await message.channel.send('Unable to Connect to the Database')
+                    return
+                elif option == 'search':
+                    if len(arguments) < 2:
+                        await message.channel.send('Usage: !search <table> <value> [value2] [value3] ...')
+                        return
+
+                    table = arguments[0].lower()
+                    values = arguments[1:]
+
+                    if table not in TABLES or not _IDENTIFIER_RE.fullmatch(table):
+                        await message.channel.send(f'Table: {table} - does not exist')
+                        return
+                    safe_table = f'"{table}"'
+
+                    try:
+                        with connect() as connection:
+                            ans, columns = query(connection,
+                                                 "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+                                                 table)
+                            table_columns = [c[0].lower() for c in ans]
+
+                            conditions = []
+                            params = []
+                            for val in values:
+                                col_checks = [f'CAST("{col}" AS TEXT) ILIKE %s' for col in table_columns]
+                                conditions.append("(" + " OR ".join(col_checks) + ")")
+                                params.extend([f"%{val}%"] * len(table_columns))
+
+                            where_clause = " OR ".join(conditions)
+                            search_query = f'SELECT * FROM {safe_table} WHERE {where_clause} ORDER BY {TABLES[table]} DESC;'
+
+                            ans, cols = query(connection, search_query, *params)
+                            if not ans:
+                                await message.channel.send(f'No matches found for {", ".join(values)} in {table}')
+                                return
+
+                            answer = pd.DataFrame(ans, columns=cols)
+                            answer.index += 1
+                            with pd.option_context('display.min_rows', 25, 'display.max_rows', 25):
+                                await message.channel.send(f'```{answer}```')
+                    except Exception as err:
+                        logger.exception('Search failed: %s', err)
+                        await message.channel.send('Search failed')
+                    return
+            await message.channel.send('!delete, !reassign, !reset, !table, !search, more commands soon')
             return
 
     @staticmethod
@@ -316,36 +392,54 @@ class OnMessageHandler:
 
         if game_jump_message:
             if message.channel.id == channels[guild.id]['ledgers-test']:
-                if '!' in message.content:
-                    await message.channel.send('Inserting Ledger')
-                else:
+                if '!' not in message.content:
                     await message.channel.send('Not Inserting Ledger', delete_after=5)
                     return
-            words_with_url = [word for word in game_jump_message.content.split() if POKERNOW in word]
-            url = words_with_url[0].rpartition('/')[2]
+                else:
+                    await message.channel.send('Inserting Game/Ledger')
+
+            matches = [word for word in game_jump_message.content.split() if POKERNOW in word]
+            if not matches:
+                logger.warning('No PokerNow URL found in message.')
+                await self.admin_message('Ledger Not Inserted - Missing PokerNow URL')
+                return
+            url = matches[0].rpartition('/')[2]
+
             game_query = """INSERT INTO games (url, date) VALUES (%s, %s)
                             ON CONFLICT (url) DO NOTHING RETURNING game_id;"""
             game_id_query = """SELECT game_id, date FROM games WHERE url = %s;"""
             try:
                 with connect() as connection:
-                    ans, columns = query(connection, game_query, url, game_jump_message.created_at)
-                    ans2, columns2 = query(connection, game_id_query, url)
+                    new_insert, _ = query(connection, game_query, url, game_jump_message.created_at)
+                    existing_game, _ = query(connection, game_id_query, url)
             except Exception as err:
                 logger.warning('Unable to Insert Game: %s\nurl = %s', err, url)
+                await self.admin_message(guild, 'Error Connecting with Database. Ledger(s) Skipped')
+                return
 
-            if ans or ans2:
-                game_id = ans[0][0] if ans else ans2[0][0]
+            if existing_game and not new_insert:
+                response = await self.prompt(
+                    message,
+                    "Existing games for the Ledger(s) exist. Reply 'Yes' to make the insertion(s)\nYou have 2 minutes.",
+                    timeout=120,
+                    admin=True
+                )
+                if response is None:
+                    await self.admin_message(guild, 'too late')
+                    return
+                elif response.lower() not in ['yes', 'y']:
+                    return
+            if new_insert or existing_game:
+                game_id = new_insert[0][0] if new_insert else existing_game[0][0]
                 images_list = await attachments_to_bytes([attachments])
                 results = []
                 for sublist in images_list:
                     results.append(await asyncio.to_thread(ledger_gemini.gemini, sublist, game_id=game_id))
-                ledgers_sum, new_users = ledger_gemini.insert_ledgers(ledger_gemini.format_ledgers(results),
-                                                                      game_id=game_id)
-                logger.info('%s Ledger(s) Inserted', len(images_list))
-                await self._after_insert(guild, ledgers_sum, new_users)
+                await self._insert(guild, results, game_id)
                 return
             else:
-                logger.info('Ledgers Skipped, Game Already Exists')
+                logger.warning('Ledgers Skipped, Unexpected Error')
+                await self.admin_message(guild, 'Ledgers Skipped, Unexpected Error')
         return
 
     @staticmethod
@@ -363,21 +457,23 @@ class OnMessageHandler:
                         answer.index += 1
                         await message.channel.send(', '.join(answer['name'].to_list()))
                     else:
-                        await message.channel.send("!WTF")
+                        logger.info('Unexpected #query Error: %s', txt)
+                        await message.channel.send("Unexpected Error")
                     return
                 elif option in ('leaderboard', 'leaderboard_avg'):
-                    ans, columns = query_presets.leaderboard(txt.split()[1:], option == 'leaderboard_avg')
+                    ans, columns = query_presets.leaderboard(arguments, option == 'leaderboard_avg')
                     if ans:
                         answer = pd.DataFrame(ans, columns=columns)
                         answer.index += 1
                         with pd.option_context('display.min_rows', 25, 'display.max_rows', 25):
                             await message.channel.send(f'```{answer}```')
                     else:
-                        await message.channel.send("!WTF")
+                        logger.info('Unexpected #query Error: %s', txt)
+                        await message.channel.send("Unexpected Error")
                     return
                 elif option == 'career':
-                    if len(txt.split()) == 2:
-                        ans, columns = query_presets.career(txt.split()[1])
+                    if len(arguments) == 1:
+                        ans, columns = query_presets.career(arguments[0])
                         if ans:
                             answer = pd.DataFrame(ans, columns=columns)
                             answer.index += 1
@@ -455,6 +551,31 @@ class OnMessageHandler:
                             for r in duplicate_roles:
                                 if not r.id == roles[guild.id][role]:
                                     await r.delete(reason=f"Removed Duplicate of @'{role}'")
+                    return
+                elif option == 'purge':
+                    channel_mentions = message.channel_mentions
+                    if len(channel_mentions) == 1:
+                        channel = channel_mentions[0]
+                        response = await self.prompt(
+                            message,
+                            f"Enter the number of messages you want to purge from {channel.name}.\nYou have 1 minute."
+                        )
+                        if response is None:
+                            await message.channel.send('Too late!')
+                            return
+                        elif response.lower() in ['cancel', 'no', 'quit', 'exit', 'abandon']:
+                            return
+                        elif not response.isdigit() or int(response) < 1:
+                            await message.channel.send('Enter a positive integer for the number of messages to purge.')
+                            return
+                        try:
+                            await message.channel_mentions[0].purge(limit=int(response))
+                        except discord.Forbidden:
+                            logger.warning('Missing permissions to manage messages in %s', channel.name)
+                            await message.channel.send(f'Missing permissions to manage messages in {channel.name}')
+                        return
+                    await message.channel.send('!purge required exactly 1 channel to be mentioned')
+                    return
                 elif option == 'add_games':
                     # message: !add_games MM DD YYYY
                     if len(arguments) > 1:
@@ -468,8 +589,8 @@ class OnMessageHandler:
                         # oldest to newest
                         async for entry in game_channel.history(after=datetime.datetime(year=y, month=m, day=d)):
                             if POKERNOW in entry.content:
-                                words_with_url = [word for word in entry.content.split() if POKERNOW in word]
-                                links.append([words_with_url[0], entry.created_at.strftime('%m-%d-%y'), entry.created_at])
+                                matches = [word for word in entry.content.split() if POKERNOW in word]
+                                links.append([matches[0], entry.created_at.strftime('%m-%d-%y'), entry.created_at])
                         try:
                             with connect() as connection:
                                 for item in links:
@@ -512,10 +633,7 @@ class OnMessageHandler:
                         results = []
                         for index, sublist in enumerate(images_list):
                             results.append(await asyncio.to_thread(ledger_gemini.gemini, sublist, game_id=game_id + index))
-                        ledgers_sum, new_users = ledger_gemini.insert_ledgers(ledger_gemini.format_ledgers(results),
-                                                                              game_id=game_id)
-                        logger.info('%s Ledgers Inserted', len(images_list))
-                        await self._after_insert(guild, ledgers_sum, new_users)
+                        await self._insert(guild, results, game_id)
                         return
                     else:
                         await message.channel.send('!add_ledgers GID MM DD YYYY')
@@ -587,9 +705,9 @@ class OnMessageHandler:
         guild = message.guild
         try:
             with connect() as connection:
-                ans, cols = query(connection, email_query, message.author.id)
-            if ans:
-                return ans[0][0]
+                rows, cols = query(connection, email_query, message.author.id)
+            if rows:
+                return rows[0][0]
             else:
                 await self.admin_message(guild, f"{message.author.name} missing from database")
         except Exception as err:
@@ -605,6 +723,21 @@ class OnMessageHandler:
                     email = entry_email[0]
                 break
         return email
+
+    async def _insert(self, guild: discord.Guild, results: list[pd.DataFrame], game_id: int):
+        ledgers_sum, new_users, errors, success = ledger_gemini.insert_ledgers(ledger_gemini.format_ledgers(results),
+                                                                      game_id=game_id)
+        if errors:
+            error_text = "\n".join(errors[:5])
+            if len(errors) > 5:
+                error_text += f'\n... {len(errors)} errors'
+            await self.admin_message(guild, f"⚠️ Ledger Insert Errors:\n{error_text}")
+
+        if success:
+            num_ledgers = sum(len(df) for df in results if not df.empty)
+            logger.info('%s Ledger(s) Inserted', num_ledgers)
+            await self.admin_message(guild, f"Inserted Ledger(s)")
+        await self._after_insert(guild, ledgers_sum, new_users)
 
     async def _after_insert(self, guild: discord.Guild, ledgers_sum: int, new_users: list[str]) -> None:
         await self.reset_sequences(guild)

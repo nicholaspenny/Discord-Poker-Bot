@@ -151,11 +151,18 @@ async def admin_message(guild: discord.Guild, content: str, file_path: str = Non
         logger.exception('Failed to send admin message in %s: %s', guild.name, err)
 
 
-async def prompt(message: discord.Message, prompt_text: str, timeout: float = 60.0) -> Optional[str]:
-    await message.channel.send(prompt_text)
+async def prompt(message: discord.Message, prompt_text: str, timeout: float = 60.0, admin = False) -> Optional[str]:
+    if admin:
+        channel = message.guild.get_channel(channels[message.guild.id]['admin'])
+    else:
+        channel = message.channel
+    await channel.send(prompt_text)
 
     def check(m: discord.Message) -> bool:
-        return m.author == message.author and m.channel == message.channel
+        if admin:
+            return m.author.get_role(roles[m.guild.id]['admin']) is not None and not m.author.bot and m.channel == channel
+        else:
+            return m.author == message.author and m.channel == channel
 
     try:
         reply = await client.wait_for('message', timeout=timeout, check=check)

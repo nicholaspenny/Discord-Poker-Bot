@@ -25,12 +25,12 @@ def gemini(images: list[tuple[bytes, str]], game_id=None) -> pd.DataFrame:
         GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
         if GEMINI_API_KEY is None:
-            logger.error('Error: GOOGLE_API_KEY environment variable not set.')
+            logger.exception('Error: GOOGLE_API_KEY environment variable not set.')
 
         try:
             client = genai.Client()
         except Exception as e:
-            logger.error(f"Failed to create GenAI client. Ensure GEMINI_API_KEY is set. Error: {e}")
+            logger.exception("Failed to create GenAI client. Ensure GEMINI_API_KEY is set. Error: %s", e)
             return pd.DataFrame()
 
         image_parts = []
@@ -58,6 +58,7 @@ def gemini(images: list[tuple[bytes, str]], game_id=None) -> pd.DataFrame:
     except Exception as e:
         logger.exception('%sError generating Gemini response. %s', prefix, e)
         return pd.DataFrame()
+    df2 = None
     try:
         lines = response.text.strip().splitlines()
         logger.info('%sResponse Completed', prefix)
@@ -74,6 +75,7 @@ def gemini(images: list[tuple[bytes, str]], game_id=None) -> pd.DataFrame:
         return df
     except Exception as e:
         logger.exception('Error formatting response from Gemini: %s', e)
+        logger.info('Gemini Response: %s', df2)
         return pd.DataFrame()
 
 
@@ -100,9 +102,11 @@ def format_ledgers(data: list[pd.DataFrame]) -> list[pd.DataFrame]:
     return data
 
 
-def insert_ledgers(results: list[pd.DataFrame], game_id: int) -> tuple[int, list[str]]:
+def insert_ledgers(results: list[pd.DataFrame], game_id: int) -> tuple[int, list[str], list[str], bool]:
+    errors = []
+    new_users = []
+    success = True
     if results:
-        logger.info('Ledgers Completed')
         game_query = """INSERT INTO games (game_id, url, date) VALUES (%s, %s, CURRENT_DATE) 
                             ON CONFLICT DO NOTHING RETURNING game_id;"""
         clear_query = """DELETE FROM ledgers WHERE game_id = %s;"""
@@ -113,7 +117,6 @@ def insert_ledgers(results: list[pd.DataFrame], game_id: int) -> tuple[int, list
                         VALUES (%s, %s, %s, %s)
                         ON CONFLICT (game_id, user_id) DO NOTHING;"""
         sum_query = """SELECT SUM(net) FROM ledgers"""
-        new_users = []
         try:
             with connect() as connection:
                 # [alias, user_id, net]
@@ -129,9 +132,16 @@ def insert_ledgers(results: list[pd.DataFrame], game_id: int) -> tuple[int, list
                                 new_users.append(f'{ans2[0]}: {row.alias} ({row.user_id})')
                             query(connection, ledger_query, game_id, row.user_id, row.net, row.alias)
                         logger.info('Inserting at %s', game_id)
+                    else:
+                        logger.info('Unable to Insert at %s', game_id)
+                        errors.append(f'Unable to Insert at game_id: {game_id}')
                     game_id += 1
         except Exception as e:
-            logger.error('Unable to Insert Ledgers: %s', e)
+            logger.exception('Unexpected Error While Attempting to Insert Ledgers: %s', e)
+            errors.append(f'No Ledgers Inserted. Unexpected Error at game_id: {game_id}')
+            success = False
+        else:
+            logger.info('Ledgers Completed')
 
         try:
             with connect() as connection:
@@ -140,10 +150,14 @@ def insert_ledgers(results: list[pd.DataFrame], game_id: int) -> tuple[int, list
         except Exception as e:
             logger.warning('Unable to Retrieve Sum of Ledgers: %s', e)
             ledgers_sum = 0
+        else:
+            logger.info('Sum of Ledgers: %s', ledgers_sum)
 
-        return ledgers_sum, new_users
+        return ledgers_sum, new_users, errors, success
     else:
-        return -1, []
+        errors.append("No ledgers provided.")
+        success = False
+        return -1, [], errors, success
 
 def spinner():
     global done
@@ -180,7 +194,7 @@ def main():
     t.join()
 
     if game_id is not None:
-        ledgers_sum, new_users = insert_ledgers(format_ledgers([response]), game_id)
+        ledgers_sum, _, _, _ = insert_ledgers(format_ledgers([response]), game_id)
         if ledgers_sum:
             print(ledgers_sum)
     else:
