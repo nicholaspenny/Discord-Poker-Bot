@@ -20,6 +20,10 @@ done = False
 
 
 def gemini(images: list[tuple[bytes, str]], game_id=None) -> pd.DataFrame:
+    if not images:
+        logger.warning("No Images Provided")
+        return pd.DataFrame()
+
     prefix = f'{game_id}: ' if game_id is not None else ''
     try:
         GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
@@ -39,11 +43,18 @@ def gemini(images: list[tuple[bytes, str]], game_id=None) -> pd.DataFrame:
                 genai.types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
             )
         # Prompt for the vision model
-        prompt = ('Convert the single ledger in the photo(s) to a table. If there are multiple photos, '
-                  'the ledger has been split and may or may not contain duplicated rows across the photos.'
-                  '\nColumns: PLAYER, ID, BUY-IN, BUY-OUT, STACK, NET; '
-                  'where player is the string before the @ sign, and id is the string after the @ sign.'
-                  f'\nRespond with only the table, continue with output regardless of any issue or error.')
+        prompt = ('Convert the single ledger in the photo(s) to a pipe-delimited table.'
+                  '\nIf there are multiple photos, the ledger has been split and may contain duplicated rows.'
+                  '\n\n**IMPORTANT RULES:**'
+                  '\n1. Your response MUST begin with this exact header row:'
+                  '\n  PLAYER | ID | BUY-IN | BUY-OUT | STACK | NET'
+                  '\n - (This header is required for processing and reflects the correct data order)'
+                  '\n - (Even if the column names are not in the images, the data is in this order)'
+                  '\n2. The PLAYER is the string before the rightmost @ sign'
+                  '\n3. The ID is the string after the rightmost @ sign typically 10 characters long'
+                  '\n\n4. Combine the data from all images and remove duplicates'
+                  '\n5. Respond with only the table. Continue with the response regardless of any issue or error.'
+                  )
         #prompt = 'What do you see in these photos'
         text_part = genai.types.Part.from_text(text=prompt)
         contents = [
@@ -58,39 +69,102 @@ def gemini(images: list[tuple[bytes, str]], game_id=None) -> pd.DataFrame:
     except Exception as e:
         logger.exception('%sError generating Gemini response. %s', prefix, e)
         return pd.DataFrame()
-    df2 = None
+
     try:
         lines = response.text.strip().splitlines()
         logger.info('%sResponse Completed', prefix)
+        logger.info('Gemini response: %s', lines)
 
         # trimming leading and trailing whitespace | ignoring: blank lines, stub rows, line of dashes from table
         ledgers = [l for line in lines if (l := line.strip()) and len(line) > 30 and any(c.isalpha() for c in line)]
-        rows = [line.strip('|').split('|') for line in ledgers]
+        if not ledgers:
+            raise ValueError(f"Invalid Gemini response: {lines}")
+
+        EXPECTED_COLUMNS = ['PLAYER', 'ID', 'BUY-IN', 'BUY-OUT', 'STACK', 'NET']
+        delimiter = '|'
+        rows = [line.strip(' |^').split(delimiter) for line in ledgers]
         rows = [[cell.strip() for cell in row] for row in rows]
-        df = pd.DataFrame(rows[1:], columns=rows[0])
-        df.columns = df.columns.str.upper()
-        df = df.drop(columns=['BUY-IN']).drop(columns=['BUY-OUT']).drop(columns=['STACK'])
-        df = df.rename(columns={'PLAYER': 'alias'}).rename(columns={'ID': 'user_id'}).rename(columns={'NET': 'net'})
+
+        if not rows:
+            raise ValueError(f"Error When Formating Gemini response: {lines}")
+
+        if [c for c in EXPECTED_COLUMNS if c not in [x.upper() for x in rows[0]]]:
+            header = EXPECTED_COLUMNS
+            data = rows
+        else:
+            header = rows[0]
+            data = rows[1:]
+
+        logger.info('header: %s', header)
+        logger.info('data: %s', data)
+
+        row_length = len(header)
+        for i, row in enumerate(data, start=1):
+            if len(row) != row_length:
+                raise ValueError(f"Row {i} has incorrect number of columns: {row}")
+
+        df = pd.DataFrame(data, columns=[col.strip().upper() for col in header])
+
+        required_cols = ['PLAYER', 'ID', 'NET']
+        missing_cols = [c for c in required_cols if c not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns from Gemini response: {missing_cols}")
+        df = df[required_cols].rename(columns={'PLAYER': 'alias', 'ID': 'user_id', 'NET': 'net'})
+        df = df.sort_values("user_id").reset_index(drop=True)
         df['net'] = (df['net'].astype(float) * 100).round().astype(int)
         return df
     except Exception as e:
         logger.exception('Error formatting response from Gemini: %s', e)
-        logger.info('Gemini Response: %s', df2)
         return pd.DataFrame()
 
 
-def format_ledgers(data: list[pd.DataFrame]) -> list[pd.DataFrame]:
+def reconcile_ledgers(gemini_df: pd.DataFrame, csv_df: pd.DataFrame) -> bool:
     try:
-        user_query = """SELECT user_id FROM users;"""
-        with connect() as connection:
-            ans, cols = query(connection, user_query)
+        logger.info('Attempting to Reconcile Ledgers')
+        if csv_df.empty or gemini_df.empty or len(gemini_df) != len(csv_df):
+            return False
+
+        use_csv = True
+        gemini_df = gemini_df.sort_values(["net", "alias"], ascending=[False, True]).reset_index(drop=True)
+        csv_df = csv_df.sort_values(["net", "alias"], ascending=[False, True]).reset_index(drop=True)
+        g_df = gemini_df[["user_id", "net"]]
+        c_df= csv_df[["user_id", "net"]]
+
+        USER_ID_THRESHOLD = 55  # loose, but this assumes all nets are equal, unlikely if not a match
+        for (g_uid, g_net), (c_uid, c_net) in zip(g_df.itertuples(index=False), c_df.itertuples(index=False)):
+            if g_net != c_net:
+                logger.warning("Net Mismatch: Resorting to Gemini: %s, %s", g_net, c_net)
+                use_csv = False
+                break
+            if g_uid != c_uid:
+                score = fuzz.ratio(g_uid, c_uid)
+                if score < USER_ID_THRESHOLD:
+                    logger.warning("UserID Mismatch: Resorting to Gemini: %s, %s: %s", g_uid, c_uid, score)
+                    use_csv = False
+                    break
+
+        if use_csv:
+            logger.info("Attempting Insert With Scraped Ledger CSV")
+            return True
+        return False
+    except Exception as err:
+        logger.exception('Error Reconciling Ledgers: %s', err)
+        return False
+
+
+def format_ledgers(results: list[pd.DataFrame]) -> list[pd.DataFrame]:
+    try:
+        user_query = "SELECT user_id FROM users"
+        with connect() as conn:
+            ans, cols = query(conn, user_query)
     except Exception as e:
-        logger.warning('Unable to Access Users from Database: %s', e)
+        logger.warning('Unable to Access Database to Fuzzy Match Ledgers, Proceeding: %s', e)
     else:
+        logger.info('Attempting to Fuzzy Match Ledgers')
         users = [item[0] for item in ans]
         try:
             threshold = 70.1
-            for df in data:
+            for df in results:
                 for i in df.index:
                     user_id_ocr = df.at[i, 'user_id']
                     match = process.extractOne(user_id_ocr, users, scorer=fuzz.ratio)
@@ -99,39 +173,58 @@ def format_ledgers(data: list[pd.DataFrame]) -> list[pd.DataFrame]:
         except Exception as e:
             logger.warning('Warning, Fuzzy Pattern Matching Failed: %s', e)
 
-    return data
+    return results
 
 
-def insert_ledgers(results: list[pd.DataFrame], game_id: int) -> tuple[int, list[str], list[str], bool]:
-    errors = []
+def insert_ledgers(results: list[pd.DataFrame], game_id: int, csv=False) -> tuple[int, list[str], list[str], list[str], list[int]]:
+    linked_users = []
     new_users = []
-    success = True
+    errors = []
+    successes = []
     if results:
+        logger.info('Attempting to Insert Ledgers')
         game_query = """INSERT INTO games (game_id, url, date) VALUES (%s, %s, CURRENT_DATE) 
-                            ON CONFLICT DO NOTHING RETURNING game_id;"""
-        clear_query = """DELETE FROM ledgers WHERE game_id = %s;"""
-        select_user_query = """SELECT user_id FROM users WHERE user_id = %s;"""
-        create_player_query = """INSERT INTO players (name) VALUES (%s) RETURNING player_id;"""
-        create_user_query = """INSERT INTO users (player_id, user_id) VALUES (%s, %s);"""
+                        ON CONFLICT DO NOTHING RETURNING game_id"""
+        clear_query = "DELETE FROM ledgers WHERE game_id = %s"
+        select_user_query = "SELECT user_id FROM users WHERE user_id = %s"
+        match_player_query = """SELECT DISTINCT u.player_id, p.name
+                                FROM ledgers l
+                                JOIN users u ON l.user_id = u.user_id
+                                Join players p ON u.player_id = p.player_id
+                                WHERE l.alias = %s"""
+        create_player_query = "INSERT INTO players (name) VALUES (%s) RETURNING player_id"
+        create_user_query = "INSERT INTO users (player_id, user_id) VALUES (%s, %s)"
         ledger_query = """INSERT INTO ledgers (game_id, user_id, net, alias) 
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (game_id, user_id) DO NOTHING;"""
-        sum_query = """SELECT SUM(net) FROM ledgers"""
+                          VALUES (%s, %s, %s, %s)
+                          ON CONFLICT (game_id, user_id) DO NOTHING"""
+        sum_query = "SELECT SUM(net) FROM ledgers"
         try:
-            with connect() as connection:
+            with connect() as conn:
                 # [alias, user_id, net]
                 for df in results:
                     if not df.empty:
-                        query(connection, game_query, game_id, game_id)
-                        query(connection, clear_query, game_id)
-                        for row in df.itertuples(index=False):
-                            ans1, cols1 = query(connection, select_user_query, row.user_id)
-                            if not ans1:
-                                ans2, cols2 = query(connection, create_player_query, row.alias)
-                                query(connection, create_user_query, ans2[0], row.user_id)
-                                new_users.append(f'{ans2[0]}: {row.alias} ({row.user_id})')
-                            query(connection, ledger_query, game_id, row.user_id, row.net, row.alias)
+                        query(conn, game_query, game_id, game_id)
+                        query(conn, clear_query, game_id)
+                        for user_id, alias, net in df[['user_id', 'alias', 'net']].itertuples(index=False):
+                            ans, _ = query(conn, select_user_query, user_id)
+                            if not ans:
+                                player_id = None
+                                if csv:
+                                    player_matches, _ = query(conn, match_player_query, alias)
+                                    if len(player_matches) == 1:
+                                        player_id = player_matches[0][0]
+                                        player_name = player_matches[0][1]
+                                        linked_users.append(f'{player_id}: {alias} ({user_id}) linked to {player_name}')
+
+                                if player_id is None:
+                                    new_player, _ = query(conn, create_player_query, alias)
+                                    player_id = new_player[0][0]
+                                    new_users.append(f'{player_id}: {alias} ({user_id})')
+
+                                query(conn, create_user_query, player_id, user_id)
+                            query(conn, ledger_query, game_id, user_id, net, alias)
                         logger.info('Inserting at %s', game_id)
+                        successes.append(game_id)
                     else:
                         logger.info('Unable to Insert at %s', game_id)
                         errors.append(f'Unable to Insert at game_id: {game_id}')
@@ -139,13 +232,13 @@ def insert_ledgers(results: list[pd.DataFrame], game_id: int) -> tuple[int, list
         except Exception as e:
             logger.exception('Unexpected Error While Attempting to Insert Ledgers: %s', e)
             errors.append(f'No Ledgers Inserted. Unexpected Error at game_id: {game_id}')
-            success = False
+            successes = []
         else:
             logger.info('Ledgers Completed')
 
         try:
-            with connect() as connection:
-                ledgers_sum, _ = query(connection, sum_query)
+            with connect() as conn:
+                ledgers_sum, _ = query(conn, sum_query)
                 ledgers_sum = ledgers_sum[0][0]
         except Exception as e:
             logger.warning('Unable to Retrieve Sum of Ledgers: %s', e)
@@ -153,11 +246,10 @@ def insert_ledgers(results: list[pd.DataFrame], game_id: int) -> tuple[int, list
         else:
             logger.info('Sum of Ledgers: %s', ledgers_sum)
 
-        return ledgers_sum, new_users, errors, success
+        return ledgers_sum, linked_users, new_users, errors, successes
     else:
         errors.append("No ledgers provided.")
-        success = False
-        return -1, [], errors, success
+        return -1, [], [], errors, []
 
 def spinner():
     global done

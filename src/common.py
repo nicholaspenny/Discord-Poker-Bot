@@ -1,10 +1,29 @@
-TABLES = {'players': 'player_id', 'users': 'player_id', 'ledgers': 'game_id', 'games': 'game_id'}
+TABLES = {
+    'players': {
+        'lookup_key': 'player_id',
+        'sort_by': '"name" ASC'
+    },
+    'users': {
+        'lookup_key': 'player_id',
+        'sort_by': '"user_id" ASC'
+    },
+    'ledgers': {
+        'lookup_key': 'game_id',
+        'sort_by': '"net" DESC, "alias" ASC'
+    },
+    'games': {
+        'lookup_key': 'game_id',
+        'sort_by': '"date" DESC'
+    }
+}
 
 CHANNELS_TEMPLATE = {
-    'admin', 'commands', 'database', 'email', 'email-database', 'game', 'game-test', 'graph',
-    'graph-test', 'ledgers', 'ledgers-test', 'manage', 'music', 'query', 'query-test', 'roles'
+    'admin', 'database', 'email', 'email-database', 'game', 'game-test', 'graph', 'graph-test',
+    'invites', 'ledgers', 'ledgers-test', 'manage', 'music', 'query', 'query-test', 'roles'
 }
-ROLES_TEMPLATE = {'star', 'admin', 'poker bot', 'email needed'}
+ROLES_TEMPLATE = {'admin', 'email needed', 'game runner', 'poker', 'poker bot'}
 
-channels: dict[int: dict[str, int]] = {}
-roles: dict[int: dict[str, int]] = {}
+channels: dict[int, dict[str, int]] = {}
+roles: dict[int, dict[str, int]] = {}
+
+timezone = '' #tz identifier, ie 'America/Toronto' for EST/EDT

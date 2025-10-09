@@ -1,10 +1,11 @@
 import csv
 import io
+import json
 import logging
 import os
 import re
 import sys
-from typing import Optional
+from typing import Optional, Union
 
 import matplotlib
 matplotlib.use('Agg')
@@ -23,147 +24,259 @@ plt.rcParams['axes.prop_cycle'] = plt.cycler(color=COLORS)
 logger = logging.getLogger(__name__)
 
 
-def graph_setup(csv1: bytes, csv2: bytes) -> Optional[io.BytesIO]:
-    logger.info('Preparing CSVs For Graphing')
+def classify_graph_file(text_content: str) -> Optional[tuple[str, Union[dict[str, object], list[Union[str, list[str]]]]]]:
     try:
-        csv_text_1 = csv1.decode('utf-8')
-        csv_text_2 = csv2.decode('utf-8')
+        data = json.loads(text_content)
+        if isinstance(data, dict) and 'hands' in data:
+            return ('json_hands', data)
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        csv_rows = list(csv.reader(io.StringIO(text_content)))
+        if csv_rows and len(csv_rows) > 0 and len(csv_rows[0]) > 0:
+            first_cell = csv_rows[0][0].strip()
+            if first_cell == 'player_nickname':
+                return 'csv_ledger', csv_rows
+            elif first_cell == 'entry':
+                return 'csv_log', [row[0] for row in csv_rows]
+    except Exception:
+        pass
+    return None
+
+
+def json_to_csv_list(json_data: dict[str, object]) -> list[str]:
+    csv_rows = []
+    hands = json_data.get('hands', [])
+
+    # Map event types to readable actions
+    event_type_map = {
+        0: "checks",
+        1: "bets",  # bomb pot
+        2: "posts a big blind of",
+        3: "posts a small blind of",
+        4: "posts missed big blind of",
+        5: "posts missed small blind of",
+        6: "posts a straddle",
+        7: "calls",
+        8: "raises to",  # or "bets"
+        10: "collected",
+        11: "folds",
+        12: "shows",
+        13: "posts an ante",
+        14: "runs it twice",
+        15: None, #End of hand Marker
+        16: "Uncalled bet of"
+    }
+
+    for hand in reversed(hands):  # Process in reverse order like original
+        hand_id = hand.get('id', '')
+        hand_number = hand.get('number', '')
+        hand_actions = []
+        # Starting hand line
+        hand_actions.append(f'-- starting hand #{hand_number} (id: {hand_id}) --')
+
+        # Player stacks line
+        players = hand.get('players', [])
+        stack_info = " | ".join([f'#{p["seat"]} "{p["name"]} @ {p["id"]}" ({p["stack"] / 100:.2f})'
+                                 for p in players])
+        hand_actions.append(f'Player stacks: {stack_info}')
+
+        # Process events
+        seat_to_player = {p['seat']: p for p in players}
+
+        for event in hand.get('events', []):
+            payload = event.get('payload', {})
+            event_type = payload.get('type')
+            seat = payload.get('seat')
+            value = payload.get('value', 0) / 100.0
+
+            if event_type == 9:  # Community cards
+                cards = payload.get('cards', [])
+                card_str = ", ".join(cards) if cards else ""
+                turn = payload.get('turn', 1)
+                if turn == 1:
+                    hand_actions.append(f'Flop: [{card_str}]')
+                elif turn == 2:
+                    hand_actions.append(f'Turn: [{card_str}]')
+                elif turn == 3:
+                    hand_actions.append(f'River: [{card_str}]')
+                # Add Turn/River logic as needed
+            elif seat and seat in seat_to_player:
+                player = seat_to_player[seat]
+                player_name = f'"{player["name"]} @ {player["id"]}"'
+
+                if event_type in event_type_map:
+                    action = event_type_map[event_type]
+                    if event_type in [1, 2, 3, 4, 5, 6, 7, 8]:  # Actions with values
+                        hand_actions.append(f'{player_name} {action} {value:.2f}')
+                    elif event_type == 10:  # Collect pot
+                        hand_actions.append(f'{player_name} collected {value:.2f} from pot')
+                    elif event_type == 16:  # Uncalled bet
+                        hand_actions.append(f'Uncalled bet of {value:.2f} returned to {player_name}')
+                    elif event_type in [0, 11]:  # Check, Fold
+                        hand_actions.append(f'{player_name} {action}')
+                    elif event_type == 12:  # Show cards
+                        cards = payload.get('cards', [])
+                        card_str = ", ".join([c for c in cards if c]) if cards else ""
+                        hand_actions.append(f'{player_name} shows {card_str}')
+                    elif event_type == 14:  # Run it twice
+                        hand_actions.append(f'{player_name} {action}')
+
+        # Ending hand line
+        hand_actions.append(f'-- ending hand #{hand_number} --')
+        csv_rows.extend(reversed(hand_actions))
+
+    return csv_rows
+
+
+def graph_setup(file1: bytes, file2: bytes) -> Optional[io.BytesIO]:
+    try:
+        file1_text = file1.decode('utf-8')
+        file2_text = file2.decode('utf-8')
+
+        f1 = classify_graph_file(file1_text)
+        f2 = classify_graph_file(file2_text)
+
+        if not f1 or not f2:
+            logger.warning("Could not classify one or both files")
+            return None
+
+        if f1[0] == 'csv_ledger':
+            if f2[0] == 'csv_log':
+                return graph(f2[2], f1[1])
+            elif f2[0] == 'json_hands':
+                return graph(json_to_csv_list(f2[1]), f1[1])
+        elif f2[0] == 'csv_ledger':
+            if f1[0] == 'csv_log':
+                return graph(f1[1], f2[1])
+            elif f1[0] == 'json_hands':
+                return graph(json_to_csv_list(f1[1]), f2[1])
+
+        logger.warning(f"Incompatible file combination: {f1[0]} + {f2[0]}")
+        return None
     except Exception as err:
-        logger.warning("Failed to read CSVs: %s", err)
-        return None
-
-    csv_rows_1 = list(csv.reader(io.StringIO(csv_text_1)))
-    csv_rows_2 = list(csv.reader(io.StringIO(csv_text_2)))
-
-    ledger = None
-    log = None
-    if csv_rows_1 and csv_rows_1[0]:
-        if csv_rows_1[0][0] == 'entry':
-            log = csv_rows_1
-        if csv_rows_1[0][0] == 'player_nickname':
-            ledger = csv_rows_1
-    if csv_rows_2 and csv_rows_2[0]:
-        if csv_rows_2[0][0] == 'entry':
-            log = csv_rows_2
-        if csv_rows_2[0][0] == 'player_nickname':
-            ledger = csv_rows_2
-
-    if log and ledger:
-        return graph(log, ledger)
-    else:
+        logger.warning("Failed to process files: %s", err)
         return None
 
 
-def graph(log: list[list[str]], ledger: list[list[str]]) -> io.BytesIO:
+def graph(log: list[list[str]], ledger: list[str]) -> io.BytesIO:
     players = {}  # userid: alias
-    transactions = {}  # userid: [pot net, stack change, stack change bool, street action]
-    stack_sizes = {}  # userid: [stack at start of hand #]
-    buy_ins = {}  # userid: [total net buy_in/buy_out at start of hand #]
+    player_data = {}  # userid: { 'net': [], 'hand_net': float, 'street_invested': float }
 
+    # Build player mapping from ledger
     for row in ledger[1:]:
         players[row[1]] = row[0]
-    for player in players.keys():
-        transactions[player] = [0.0, 0.0, 0.0, 0.0]
-        buy_ins[player] = [0.0]
-        stack_sizes[player] = [0.0]
 
-    # Process of parsing through the log
-    logger.info('Starting Log Conversion')
+    matches = []
+    for entry in reversed(log):
+        before, sep, after = entry.partition('changed the ID from ')
+        if sep:
+            a = after.split()
+            matches.append((a[0], a[2]))
+
+    for old, new in matches:
+        log = [entry.replace(old, new) for entry in log]
+
+    # Initialize player data
+    for player_id in players.keys():
+        player_data[player_id] = {
+            'net': [0.0],  # Starting with a net of 0 at hand 0
+            'hand_net': 0.0,  # Running net during hands
+            'street_invested': 0.0  # Amount invested on current street (for raises)
+        }
+
+    # Process log in reverse (oldest first)
     hand_number = 0
-    line_number = 0
-    for row in reversed(log):
-        line_number += 1
-        line = row[0]
+    for line in reversed(log):
         if line.startswith('-- starting'):
             hand_number += 1
+            # Reset street invested for new hand
+            for player_id in player_data:
+                player_data[player_id]['hand_net'] = 0.0
+                player_data[player_id]['street_invested'] = 0.0
+
+        elif line.startswith('-- ending'):
+            for player_id in player_data:
+                player_data[player_id]['net'][-1] += player_data[player_id]['hand_net'] - player_data[player_id]['street_invested']
+
         elif line.startswith('Player stacks:'):
-            for name, quantity in transactions.items():
-                if not (re.search(f'{name}', line)):
-                    stack_sizes[name].append(stack_sizes[name][hand_number - 1] + quantity[0])
-                    if quantity[2]:
-                        stack_sizes[name][hand_number] += quantity[1]
-                    buy_ins[name].append(buy_ins[name][hand_number - 1] + quantity[1])
-                    quantity[0] = 0
-                    quantity[1] = 0
-                    quantity[2] = 0
-                else:
-                    dollar = re.search(fr'{name}" [(]\d+\.\d\d', line)
-                    dollar = float(dollar.group().split()[1].lstrip('('))
-                    stack_sizes[name].append(dollar)
-                    buy_ins[name].append(quantity[1] + buy_ins[name][hand_number - 1])
-                    quantity[0] = 0
-                    if quantity[2]:
-                        quantity[1] = 0
-                        quantity[2] = 0
-        elif line.startswith(('-- ending', 'Flop:', 'Turn:', 'River:')):
-            for name, quantity in transactions.items():
-                quantity[0] += quantity[3]
-                quantity[3] = 0
-        elif re.search(r"approved", line):
-            for name, quantity in transactions.items():
-                if re.search(name, line):
-                    dollar = re.search(r" \d+\.\d\d", line)
-                    dollar = float(dollar.group())
-                    quantity[1] += dollar
-                    quantity[2] = 1
-        elif re.search(r"updated", line):
-            for name, quantity in transactions.items():
-                if re.search(name, line):
-                    old_dollar = re.search(r" \d+\.\d\d ", line)
-                    old_dollar = float(old_dollar.group())
-                    new_dollar = re.search(r" \d+\.\d\d.$", line)
-                    new_dollar = float(new_dollar.group().rstrip('.'))
-                    quantity[1] += new_dollar - old_dollar
-                    quantity[2] = 1
-        elif re.search(r"quits the game", line):
-            for name, quantity in transactions.items():
-                if re.search(name, line):
-                    dollar = re.search(r" \d+\.\d\d", line)
-                    dollar = float(dollar.group())
-                    quantity[1] -= dollar
-                    quantity[2] = 1
-        elif re.search(r"missing small blind", line):
-            for name, quantity in transactions.items():
-                if re.search(name, line):
-                    dollar = re.search(r" \d+\.\d\d", line)
-                    dollar = float(dollar.group())
-                    quantity[0] -= dollar
-        else:
-            for name, quantity in transactions.items():
-                if re.search(f'{name}', line):
-                    if line.split()[0] == 'Uncalled':
-                        quantity[0] += float(line.split()[3])
-                    elif line.startswith('"') and line.split('@ ')[1].startswith(name):
-                        if line.split('@ ')[1].split()[1] == 'collected':
-                            quantity[0] += float(line.split('@ ')[1].split()[2])
-                        elif re.search(r" \d+\.\d\d", line) and not (re.search(r"joined", line)):
-                            dollar = re.search(r" \d+\.\d\d", line)
-                            dollar = float(dollar.group())
-                            quantity[3] = 0 - dollar
+            for player_id in player_data:
+                player_data[player_id]['net'].append(player_data[player_id]['net'][-1])
 
-    # End of log final tabulations
-    hand_number += 1
-    for name, quantity in transactions.items():
-        stack_sizes[name].append(stack_sizes[name][hand_number - 1] + quantity[0])
-        if quantity[2]:
-            stack_sizes[name][hand_number] += quantity[1]
-        buy_ins[name].append(quantity[1] + buy_ins[name][hand_number - 1])
-        quantity[0] = 0
+        elif line.startswith(('Flop:', 'Turn:', 'River:')):
+            # Street change or hand end - reset street invested
+            for player_id in player_data:
+                player_data[player_id]['hand_net'] -= player_data[player_id]['street_invested']
+                player_data[player_id]['street_invested'] = 0.0
 
-    # Changing user_ids to names in each dictionary, to be reflected in the graph's legend
-    stack_sizes = update_names(stack_sizes, players)
-    transactions = update_names(transactions, players)
-    buy_ins = update_names(buy_ins, players)
+        elif line.startswith('"'):
+            # This is a player action line
+            for player_id in player_data:
+                if player_id not in line:
+                    continue
+
+                # Parse the action
+                parts = line.split(f'@ {player_id}"')
+                if len(parts) < 2:
+                    continue
+
+                action_part = parts[1].strip()
+
+                # Collect from pot (positive to net)
+                if action_part.startswith('collected'):
+                    match = re.search(r'collected ([0-9]+\.[0-9]+)', action_part)
+                    if match:
+                        amount = float(match.group(1))
+                        player_data[player_id]['hand_net'] += amount
+
+                # Posts blinds/straddles (negative to net, counts as street investment)
+                elif action_part.startswith('posts a missed') or action_part.startswith('posts an ante'):
+                    match = re.search(r' ([0-9]+\.[0-9]+)', action_part)
+                    if match:
+                        amount = float(match.group(1))
+                        player_data[player_id]['hand_net'] -= amount
+
+                elif any(action_part.startswith(a) for a in ['posts a', 'calls', 'raises to', 'bets']):
+                    match = re.search(r' ([0-9]+\.[0-9]+)', action_part)
+                    if match:
+                        amount = float(match.group(1))
+                        player_data[player_id]['street_invested'] = amount
+        elif line.startswith('Uncalled bet of'):
+            # Uncalled bet returned (positive to net)
+            match_amount = re.search(r'Uncalled bet of ([0-9]+\.[0-9]+)', line)
+            if match_amount:
+                amount = float(match_amount.group(1))
+                returnee = [word[:-1] for word in line.split() if word.endswith('"')][0]
+                player_data[returnee]['hand_net'] += amount
+    # Ensure all players have the same number of data points
+    max_hands = max(len(data['net']) for data in player_data.values())
+    for player_id in player_data:
+        while len(player_data[player_id]['net']) < max_hands:
+            player_data[player_id]['net'].append(player_data[player_id]['net'][-1])
+    # Convert user_ids to names
     nets = {}
-    for player, values in transactions.items():
-        nets[player] = [x1 - x2 for (x1, x2) in zip(stack_sizes[player], buy_ins[player])]
+    with connect() as conn:
+        for player_id, data in player_data.items():
+            ans, cols = query(conn, """SELECT p.name
+                                             FROM players p
+                                                      JOIN users u ON
+                                                 u.player_id = p.player_id and u.user_id = %s""", player_id)
+            if ans:
+                name = ans[0][0].title()
+                if name in nets:
+                    # Combine multiple instances of the same player
+                    nets[name] = [sum(x) for x in zip(nets[name], data['net'])]
+                else:
+                    nets[name] = data['net']
+            else:
+                nets[players[player_id] + '*'] = data['net']
 
     # Graphing with matplotlib
     try:
         fig, ax = plt.subplots(figsize=(10, 6), dpi=450)
         for user, values in nets.items():
-            numeric_values = values
-            ax.plot(numeric_values, label=user)
+            ax.plot(values, label=user)
 
         ax.set_xlabel("Hand #")
         ax.set_ylabel("Net $")
@@ -187,6 +300,7 @@ def graph(log: list[list[str]], ledger: list[list[str]]) -> io.BytesIO:
         fig.savefig(buffer, format='png')
         plt.close('all')
         buffer.seek(0)
+        logger.info('Completed Graphing')
         return buffer
     except Exception as err:
         logger.exception('Error Plotting Graph')
@@ -195,13 +309,12 @@ def graph(log: list[list[str]], ledger: list[list[str]]) -> io.BytesIO:
 def update_names(dictionaries: dict[str, list[int]], players_dict: dict[str, str]) -> dict[str,list[int]]:
     # Searching user_ids to be replaced by the player's name when they exist in the database
     # Otherwise, replacing it with the alias used during the game when they do not exist in the database
-    logger.info('Updating Names for Graph')
     new_dictionaries = {}
-    with connect() as connection:
+    with connect() as conn:
         for player in dictionaries:
-            ans, cols = query(connection, """SELECT p.name FROM players p 
+            ans, cols = query(conn, """SELECT p.name FROM players p 
                                               JOIN users u ON
-                                              u.player_id = p.player_id and u.user_id = %s;""", player)
+                                              u.player_id = p.player_id and u.user_id = %s""", player)
             if ans:
                 name = ans[0][0].title()
                 if new_dictionaries.get(name):
