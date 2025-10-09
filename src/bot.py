@@ -7,6 +7,7 @@ import subprocess
 from typing import Optional
 
 import discord
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from src import common
@@ -28,18 +29,39 @@ DATABASE_URL = (
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-client = discord.Client(intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 channels = common.channels
 roles = common.roles
 CHANNELS_TEMPLATE = common.CHANNELS_TEMPLATE
 ROLES_TEMPLATE = common.ROLES_TEMPLATE
 
+invites: dict[int, dict[str, tuple[int, Optional[datetime.datetime], int]]] = {}
+MAX_INVITE_DURATION_HOURS = 72
+
+
+async def cache_invites(guild: discord.Guild):
+    global invites
+
+    guild_invites = invites.setdefault(guild.id, {})
+    for invite in await guild.invites():
+        if not invite:
+            continue
+
+        if not invite.inviter:
+            try:
+                await invite.delete()
+            except Exception as err:
+                logger.exception('Failed to delete invite with empty inviter: %s', err)
+        else:
+            uses = invite.uses if invite.uses else 0
+            guild_invites[invite.code] = (invite.inviter.id, invite.created_at, uses)
+
 async def populate_dictionaries():
     global channels, roles
     try:
-        logger.info(f'Servers: {[(guild.name, guild.id) for guild in client.guilds]}')
-        for guild in client.guilds:
+        logger.info(f'Servers: {[(guild.name, guild.id) for guild in bot.guilds]}')
+        for guild in bot.guilds:
             guild_channels = [c for c in await guild.fetch_channels() if
                               isinstance(c, discord.TextChannel) and c.name in CHANNELS_TEMPLATE]
             channels[guild.id] = {c.name: c.id for c in sorted(guild_channels, key=lambda x: x.created_at, reverse=True)}
@@ -47,18 +69,19 @@ async def populate_dictionaries():
             roles[guild.id] = {r.name: r.id for r in sorted(guild_roles, key=lambda x: x.created_at, reverse=True)}
     except Exception as err:
         logger.warning('Using Default Dictionary Values: %s', err)
-        # This is to default hard-code dictionaries in primary server for necessary channels/roles
+        # This is to default hard-code dictionaries in the primary server for necessary channels/roles
         roles = {1:
-                     {'star': 1,
-                      'admin': 2,
-                      'poker bot': 3,
-                      'email needed': 4,
+                     {'admin': 1,
+                      'email needed': 2,
+                      'game runner': 3,
+                      'admin': 4,
+                      'poker bot': 4,
                       }
                  }
         channels = {1:
                         {'admin': 1,
-                         'commands': 2,
-                         'database': 3,
+                         'database': 2,
+                         'invites': 3,
                          'manage': 4,
                          }
                     }
@@ -70,25 +93,28 @@ async def populate_dictionaries():
             for name in ROLES_TEMPLATE:
                 mapping.setdefault(name, 0)
 
+        if not sweep_old_invites.is_running():
+            sweep_old_invites.start()
+
 
 def reset_sequence(table: str, column: str) -> int:
     reset_query = f"""SELECT setval(
                                       pg_get_serial_sequence('{table}', '{column}'),
                                       COALESCE((SELECT MAX({column}) FROM {table}), 0), -- max existing ID or 0 if empty
                                       TRUE -- next nextval() will return max+1
-                              );"""
-    next_id_query = f"SELECT COALESCE(MAX({column}), 0) + 1 FROM {table};"
+                              )"""
+    next_id_query = f"SELECT COALESCE(MAX({column}), 0) + 1 FROM {table}"
     try:
-        with connect() as connection:
-            query(connection, reset_query)
-            next_id, _ = query(connection, next_id_query)
+        with connect() as conn:
+            query(conn, reset_query)
+            next_id, _ = query(conn, next_id_query)
         return next_id
     except Exception as err:
         logger.exception('Unable to Connect to the Database: %s', err)
         raise
 
 
-async def reset_database_sequences(guild: discord.Guild = None):
+async def reset_database_sequences(guild: discord.Guild = None) -> list[str]:
     try:
         next_player = reset_sequence('players', 'player_id')
         next_game = reset_sequence('games', 'game_id')
@@ -96,10 +122,12 @@ async def reset_database_sequences(guild: discord.Guild = None):
         logger.exception('Failed to reset database sequences: %s', err)
         if guild:
             await admin_message(guild, 'Failed to reset database sequences')
+        return []
     else:
-        logger.info('Successfully reset database sequences')
-        logger.info(f'Players - Next ID: {next_player}')
-        logger.info(f'Games - Next ID: {next_game}')
+        players_sequence = f"Players - Next ID: {next_player[0][0]}"
+        games_sequence = f"Games - Next ID: {next_game[0][0]}"
+        logger.info('Successfully Reset Database Sequences.\n%s | %s', players_sequence, games_sequence)
+        return [players_sequence, games_sequence]
 
 
 def dump_database() -> Optional[str]:
@@ -120,8 +148,8 @@ def dump_database() -> Optional[str]:
         ], check=True)
         logger.info(f"Database dumped to {dump_path}")
         return dump_path
-    except subprocess.CalledProcessError as e:
-        logger.info(f"Database dump failed: {e}")
+    except subprocess.CalledProcessError as err:
+        logger.info(f"Database dump failed: {err}")
         return None
 
 
@@ -134,6 +162,40 @@ def dump_database_once() -> Optional[str]:
     else:
         logger.info('Database has already been dumped')
         return None
+
+
+async def game_email(message: discord.Message) -> str:
+    for word in message.content.split():
+        if "@" in word and "." in word and "<" not in word and not word.startswith("!"):
+            return word.strip(",.;:!?()")
+
+    guild = message.guild
+    if not guild:
+        return ''
+
+    email_query = "SELECT email FROM players WHERE discord_id = %s"
+    if len(message.mentions) == 1:
+        mention = message.mentions[0]
+        if mention.get_role(roles[guild.id]['game runner']):
+            try:
+                with connect() as conn:
+                    rows, cols = query(conn, email_query, mention.id)
+                if rows:
+                    return rows[0][0]
+            except Exception as err:
+                logger.warning("Failed to fetch email for mentioned member: %s", mention.name)
+
+    if message.author.get_role(roles[guild.id]['game runner']):
+        try:
+            with connect() as conn:
+                rows, cols = query(conn, email_query, message.author.id)
+            if rows:
+                return rows[0][0]
+        except Exception as err:
+            logger.warning("Failed to fetch email from database for message author: %s", message.author.name)
+
+    await admin_message(guild, f"Email Fetch Request failed in {message.channel.mention}")
+    return ''
 
 
 async def admin_message(guild: discord.Guild, content: str, file_path: str = None):
@@ -151,29 +213,28 @@ async def admin_message(guild: discord.Guild, content: str, file_path: str = Non
         logger.exception('Failed to send admin message in %s: %s', guild.name, err)
 
 
-async def prompt(message: discord.Message, prompt_text: str, timeout: float = 60.0, admin = False) -> Optional[str]:
-    if admin:
-        channel = message.guild.get_channel(channels[message.guild.id]['admin'])
-    else:
-        channel = message.channel
-    await channel.send(prompt_text)
+async def prompt(channel: discord.TextChannel, member: discord.Member, prompt_text: str, timeout: float = 60.0,
+                 admin=False) -> Optional[str]:
+    p = await channel.send(prompt_text)
 
     def check(m: discord.Message) -> bool:
         if admin:
-            return m.author.get_role(roles[m.guild.id]['admin']) is not None and not m.author.bot and m.channel == channel
+            return m.author.get_role(roles[m.guild.id]['admin']) is not None and m.channel == channel
         else:
-            return m.author == message.author and m.channel == channel
+            return m.author == member and m.channel == channel
 
     try:
-        reply = await client.wait_for('message', timeout=timeout, check=check)
+        reply = await bot.wait_for("message", timeout=timeout, check=check)
         return reply.content.strip()
     except asyncio.TimeoutError:
-        await message.channel.send("No response received in time. Operation cancelled.")
+        await channel.send("No Response Received In Time. Operation cancelled.")
         return None
+    finally:
+        await p.delete()
 
 
 async def shutdown_message(file_path: Optional[str] = None):
-    for guild in client.guilds:
+    for guild in bot.guilds:
         await admin_message(guild, "Poker Bot Offline - Shutting down...", file_path)
 
 
@@ -182,16 +243,16 @@ async def shutdown():
     dump_path = dump_database_once()
     try:
         await shutdown_message(dump_path)
-    except Exception as e:
-        logger.warning(f"Failed to send shutdown message: {e}")
+    except Exception as err:
+        logger.warning(f"Failed to send shutdown message: {err}")
 
     pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
     for task in pending:
         task.cancel()
     await asyncio.gather(*pending, return_exceptions=True)
 
-    if not client.is_closed():
-        await client.close()
+    if not bot.is_closed():
+        await bot.close()
 
 
 def handle_signal(sig, _):
@@ -203,7 +264,7 @@ def handle_signal(sig, _):
 signal.signal(signal.SIGINT, handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
 
-handler = OnMessageHandler(shutdown, prompt, admin_message, reset_database_sequences, dump_database)
+handler = OnMessageHandler(shutdown, prompt, admin_message, game_email, reset_database_sequences, dump_database)
 
 
 def update_guild_channel(
@@ -236,50 +297,53 @@ def update_guild_role(
         guild_roles[new_role.name] = new_role.id
 
 
-@client.event
+@bot.event
 async def on_guild_channel_create(channel: discord.abc.GuildChannel):
     update_guild_channel(channel)
 
 
-@client.event
+@bot.event
 async def on_guild_channel_update(before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
     if before.name != after.name:
         update_guild_channel(after, before)
 
 
-@client.event
+@bot.event
 async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
     update_guild_channel(old_channel=channel)
 
 
-@client.event
+@bot.event
 async def on_guild_role_create(role: discord.Role):
     update_guild_role(role)
 
 
-@client.event
+@bot.event
 async def on_guild_role_update(before: discord.Role, after: discord.Role):
     if before.name != after.name:
         update_guild_role(after, before)
 
 
-@client.event
+@bot.event
 async def on_guild_role_delete(role: discord.Role):
     update_guild_role(old_role=role)
 
 
-@client.event
+@bot.event
 async def on_guild_join(guild: discord.Guild):
     await populate_dictionaries()
-    logger.info('%s Just Joined %s', client.user, guild.name)
+    logger.info('%s Just Joined %s', bot.user, guild.name)
     await admin_message(guild, 'Poker Bot Online - At Your Service!')
 
 
-@client.event
+@bot.event
 async def on_member_join(member: discord.Member):
+    global invites
     guild = member.guild
-    email_needed_role = guild.get_role(roles[guild.id]['email needed'])
+    logger.info('Member Joined %s - %s', member.id, member.display_name)
+    logger.info('Invites Before: %s', invites)
 
+    email_needed_role = guild.get_role(roles[guild.id]['email needed'])
     if email_needed_role and not member.bot:
         try:
             await member.add_roles(email_needed_role)
@@ -289,20 +353,47 @@ async def on_member_join(member: discord.Member):
         except Exception as err:
             logger.exception('Failed to assign role in %s: %s', guild.name, err)
     else:
-        logger.warning('Missing email needed role in %s:', guild.name)
+        logger.warning('Missing "email needed" role in %s', guild.name)
         await admin_message(guild, 'Please add a role named "email needed"')
 
+    inner = invites.setdefault(guild.id, {})
+    guild_invites = {i.code: i for i in await guild.invites()}
+    found = False
+    for code, (inviter_id, created_at, uses) in list(inner.items()):
+        inv = guild_invites.get(code)
+        if inv:
+            current_uses = inv.uses or 0
+            if current_uses > uses:
+                found = True
+                logger.info('Invite: (%s - %s) | Uses: %s', code, inviter_id, uses)
+                invites[guild.id][code] = (inviter_id, created_at, current_uses)
+                ch = await bot.fetch_channel(channels[guild.id]['invites'])
+                await ch.send(f"{inv.inviter.mention} invited {member.mention}\n{inv.inviter.id} >>> {member.id}")
+                break
 
-@client.event
+    if not found:
+        for code, inv in guild_invites.items():
+            current_uses = inv.uses or 0
+            if code not in inner and current_uses > 0:
+                logger.info('Invite (Guess): (%s - %s) | Uses: %s', code, inv.inviter.id, current_uses)
+                ch = await bot.fetch_channel(channels[guild.id]['invites'])
+                await ch.send(f"{inv.inviter.mention} maybe invited {member.mention}\n{inv.inviter.id} >>> {member.id}")
+                break
+
+    await cache_invites(guild)
+    logger.info('%s: %s', guild.name, invites[guild.id])
+
+
+@bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
     added_roles = [r for r in after.roles if r not in before.roles]
     guild = after.guild
     email_needed_role = guild.get_role(roles[guild.id]['email needed'])
     if email_needed_role in added_roles:
         try:
-            with connect() as connection:
-                existing_player_query = """SELECT * FROM players WHERE discord_id = %s;"""
-                ans, cols = query(connection, existing_player_query, after.id)
+            with connect() as conn:
+                existing_player_query = "SELECT * FROM players WHERE discord_id = %s"
+                ans, cols = query(conn, existing_player_query, after.id)
                 if ans:
                     logger.info('Member (%s) already exists in database. Removing email needed role.', ans)
                     try:
@@ -311,43 +402,127 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                         logger.warning('Missing permissions to add role in %s', guild.name)
                         await admin_message(guild, 'Missing permissions to remove roles')
                 elif not after.bot:
+                    name = after.name.replace(' ', '')[:10] # uses username, might change to use after.display_name
                     insert_player_query = """INSERT INTO players (name, discord_id)
-                                             VALUES (%s, %s) RETURNING player_id;"""
-                    ans2, cols2 = query(connection, insert_player_query, after.name, after.id)
-                    await admin_message(guild, f'{after.name} Inserted into Database - {ans2[0][0]}')
+                                             VALUES (%s, %s) RETURNING player_id"""
+                    ans2, cols2 = query(conn, insert_player_query, name, after.id)
+                    await admin_message(guild, f'{after.mention} Inserted into Database: {name} - {ans2[0][0]}')
         except Exception as err:
             logger.exception('DB error checking existing player: %s', err)
             return
 
 
-@client.event
+@bot.event
+async def on_invite_create(invite: discord.Invite):
+    logger.info(f'%s created Invite - %s | %s', invite.inviter.display_name, invite.code, invite.guild.name)
+    await cache_invites(invite.guild)
+    logger.info('%s: %s', invite.guild.name, invites[invite.guild.id])
+
+@bot.event
+async def on_invite_delete(invite: discord.Invite):
+    global invites
+    if invites.get(invite.guild.id, {}):
+        invites[invite.guild.id].pop(invite.code, None)
+
+
+@tasks.loop(hours=12)
+async def sweep_old_invites():
+    global invites
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for guild_id, inner in invites.items():
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            continue
+        guild_invites = {i.code: i for i in await guild.invites()}
+
+        for code, (inviter_id, created_at, uses) in list(inner.items()):
+            if not created_at:
+                continue
+
+            age = (now - created_at).total_seconds() / 3600
+            if age > MAX_INVITE_DURATION_HOURS:
+                inv = guild_invites.get(code)
+                try:
+                    if inv:
+                        await inv.delete()
+                    else:
+                        logger.info("Invite %s already gone in guild %s", code, guild_id)
+                except discord.Forbidden:
+                    logger.warning("Missing perms to delete invite %s in %s", code, guild_id)
+                finally:
+                    invites[guild_id].pop(code, None)
+
+    for guild in bot.guilds:
+        await cache_invites(guild)
+
+    logger.info('Invites:\n%s', '\n'.join(str(g) for g in invites.items()))
+
+
+@bot.event
 async def on_ready():
-    await populate_dictionaries()
+    logger.info('%s is now running!', bot.user)
     await reset_database_sequences()
-    logger.info('%s is now running!', client.user)
-    for guild in client.guilds:
+    await populate_dictionaries()
+    for guild in bot.guilds:
         await admin_message(guild, 'Poker Bot Online - At Your Service!')
 
 
-@client.event
+@bot.event
 async def on_message(message: discord.Message):
     global channels, roles
     guild = message.guild
     cid = message.channel.id
 
+    if isinstance(message.channel, discord.Thread):
+        if message.channel.parent.id == channels[guild.id]['game']:
+            if not message.content.strip():
+                return
+            elif message.content.strip().split()[0].lower() != "!settle":
+                return
+            if message.author.get_role(roles[guild.id]['admin']):
+                logger.info(f"Attempting to Change Email for a New Game Settler: %s", message.content)
+                new_email = await game_email(message)
+                if new_email:
+                    try:
+                        async def replace_emails(m: discord.Message):
+                            words = m.content.split()
+                            new_content = m.content
+                            emails = []
+                            for i, word in enumerate(words):
+                                if "@" in word and "." in word and "<" not in word and not word.startswith("!"):
+                                    emails.append(word)
+                            for email in emails:
+                                new_content = new_content.replace(email, new_email)
+
+                            if m.content != new_content:
+                                await m.edit(content=new_content)
+
+                        game_message = await message.channel.parent.fetch_message(message.channel.id)
+                        await replace_emails(game_message)
+
+                        ledgers_channel = guild.get_channel(channels[guild.id]['ledgers'])
+                        async for entry in ledgers_channel.history(limit=10):
+                            if f"/{game_message.channel.id}/{game_message.id}" in entry.content:
+                                await replace_emails(entry)
+                    except Exception as err:
+                        logger.warning(f"Failed to change email for game settler %s", message.content)
+                        await admin_message(guild, 'Failed to change email for game settler')
+            return
+
     if cid == channels[guild.id]['email']:
         await handler.handle_email(message)
     elif cid == channels[guild.id]['email-database']:
         await handler.handle_email_database(message)
-    elif message.author != client.user:
+    elif message.author != bot.user:
         if cid == channels[guild.id]['admin']:
             await handler.handle_admin(message)
         elif cid == channels[guild.id]['manage']:
             await handler.handle_manage(message)
         elif cid == channels[guild.id]['database']:
             await handler.handle_database(message)
-        elif cid == channels[guild.id]['commands']:
-            await handler.handle_commands(message)
+        elif cid == channels[guild.id]['invites']:
+            await handler.handle_invites(message)
         elif cid in (channels[guild.id]['query'], channels[guild.id]['query-test']):
             await handler.handle_query(message)
         elif cid in (channels[guild.id]['ledgers'], channels[guild.id]['ledgers-test']):
@@ -359,4 +534,4 @@ async def on_message(message: discord.Message):
 
 
 def run_discord_bot():
-    client.run(os.getenv('DISCORD_BOT_TOKEN'), log_handler=None)
+    bot.run(os.getenv('DISCORD_BOT_TOKEN'), log_handler=None)
