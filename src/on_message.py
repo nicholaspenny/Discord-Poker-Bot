@@ -35,18 +35,19 @@ def keyword_search(text: str, keyword: str) -> str:
     return next((word for word in text.split() if keyword in word), '')
 
 
-def discord_markdown(lines: list[str], ratio=0.75, limit=2000, buffer=10, height=40) -> str:
+def discord_markdown(lines: list[str], ratio=0.75, limit=2000, height=41) -> str:
     if not lines:
         return ""
 
     max_width = len(max(lines, key=len))
-    max_rows = ((limit - 6 - buffer) // (max_width + 1)) - 1
+    max_rows = (limit - 6) // (max_width + 1)
+    max_body = min(max_rows -1, height)  # includes all rows of data and divider if needed
+
     header = lines[:1]
     rows = lines[1:]
-
-    if len(rows) > min(max_rows, height + 1):
-        top_count = min(int(max_rows * ratio), int((height + 1) * ratio))
-        bottom_count = min(int(max_rows * (1-ratio)), int(height * (1-ratio)))
+    if len(rows) > max_body:
+        top_count = int(max_body * ratio)
+        bottom_count = max_body - top_count - 1
         output = rows[:top_count] + ["." * max_width] + rows[-bottom_count:]
     else:
         output = rows
@@ -1173,3 +1174,4 @@ class OnMessageHandler:
             for user in new_users:
                 await self.admin_message(guild, f"{user} has been created")
             await self.admin_message(guild, f"!merge in <#{channels[guild.id]['database']}>")
+
