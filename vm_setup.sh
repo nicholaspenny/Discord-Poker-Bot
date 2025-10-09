@@ -44,9 +44,13 @@ if [[ -f "$APP_DIR/requirements.txt" ]]; then
     pip install --prefer-binary -r "$APP_DIR/requirements.txt"
 fi
 
+# --- Install Playwright browsers ---
+echo "==> Installing Playwright browsers..."
+playwright install --with-deps chromium
+
 # --- Create .env and database.ini from examples if missing ---
-[[ ! -f "$ENV_FILE" ]] && cp "$ENV_EXAMPLE" "$ENV_FILE" && echo "✓ Created .env from example"
-[[ ! -f "$DB_INI" ]] && cp "$DB_EXAMPLE" "$DB_INI" && echo "✓ Created database.ini from example"
+[[ ! -f "$ENV_FILE" ]] && cp "$ENV_EXAMPLE" "$ENV_FILE" && echo "Created .env from example"
+[[ ! -f "$DB_INI" ]] && cp "$DB_EXAMPLE" "$DB_INI" && echo "Created database.ini from example"
 
 # --- Extract DB credentials ---
 DB_USER=$(awk -F= '/^user[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2}' "$DB_INI" | tail -n1)
