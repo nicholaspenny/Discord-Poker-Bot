@@ -22,11 +22,12 @@ logger = logging.getLogger(__name__)
 POKERNOW = 'https://www.pokernow.club/games/'
 JUMP_URL_PREFIX = 'https://discord.com/channels/'
 
+TABLES = common.TABLES
 channels = common.channels
 roles = common.roles
-TABLES = common.TABLES
 CHANNELS_TEMPLATE = common.CHANNELS_TEMPLATE
 ROLES_TEMPLATE = common.ROLES_TEMPLATE
+timezone = common.timezone
 
 _IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
@@ -35,10 +36,28 @@ def keyword_search(text: str, keyword: str) -> str:
     return next((word for word in text.split() if keyword in word), '')
 
 
-def discord_markdown(lines: list[str], ratio=0.75, limit=2000, height=41) -> str:
-    if not lines:
+def discord_markdown(df: pd.DataFrame, ratio=0.67, limit=2000, height=41) -> str:
+    if df is None or df.empty:
         return ""
 
+    if 'date' in df.columns:
+        df['date'] = df['date'].astype('datetime64[ns, UTC]')
+        if timezone:
+            try:
+                df['date'] = df['date'].dt.tz_convert(timezone)
+            except Exception as err:
+                logging.warning(f"Invalid timezone '{timezone}', keeping UTC. Error: {err}")
+        df['date'] = df['date'].dt.strftime('%Y-%m-%d %H:%M %Z')
+
+    if 'email' in df.columns:
+        df['email'] = df['email'].apply(lambda x: x[:20] + '...' if x and len(x) > 23 else x)
+
+    if 'alias' in df.columns:
+        df['alias'] = df['alias'].apply(lambda x: x[:13] + '...' if x and len(x) > 16 else x)
+
+    df = df.fillna('-')
+    df.index += 1
+    lines = df.to_string().splitlines()
     max_width = len(max(lines, key=len))
     max_rows = (limit - 6) // (max_width + 1)
     max_body = min(max_rows -1, height)  # includes all rows of data and divider if needed
@@ -106,11 +125,11 @@ class OnMessageHandler:
         self.dump = dump_fn
 
     async def handle_admin(self, message: discord.Message):
-        # currently admin is just logs, might add functionality later
+        # currently admin is just logging critical actions, might add functionality later
         return
 
     async def handle_invites(self, message: discord.Message):
-        # for future implementation of invites
+        # currently invites is just logging invites, might add functionality later
         return
 
     async def handle_database(self, message: discord.Message):
@@ -476,10 +495,7 @@ class OnMessageHandler:
 
                             ans, cols = query(conn, table_query)
                             answer = pd.DataFrame(ans, columns=cols)
-                            answer.index += 1
-
-                            table = discord_markdown(answer.to_string().splitlines())
-                            await channel.send(f"{table}")
+                            await channel.send(f"{discord_markdown(answer)}")
                     except Exception as err:
                         logger.exception('Unable to Connect to the Database: %s', err)
                         await channel.send(f"Unable to Connect to the Database - {err}")
@@ -548,10 +564,7 @@ class OnMessageHandler:
                                 return
 
                             answer = pd.DataFrame(ans2, columns=cols)
-                            answer.index += 1
-
-                            table = discord_markdown(answer.to_string().splitlines())
-                            await channel.send(f"{table}")
+                            await channel.send(f"{discord_markdown(answer)}")
                     except Exception as err:
                         logger.exception('Unable to Complete the Search: %s', err)
                         await channel.send(f"Unable to Complete the Search - {err}")
@@ -780,9 +793,7 @@ class OnMessageHandler:
                         ans, columns = query_presets.leaderboard(arguments, option == 'leaderboard_avg')
                         if ans:
                             answer = pd.DataFrame(ans, columns=columns)
-                            answer.index += 1
-                            table = discord_markdown(answer.to_string().splitlines())
-                            await channel.send(f"{table}")
+                            await channel.send(f"{discord_markdown(answer)}")
                         else:
                             logger.info('Unexpected #query Error: %s', txt)
                             await channel.send("Unexpected Error")
@@ -833,7 +844,6 @@ class OnMessageHandler:
                             return
 
                         answer = pd.DataFrame(ans, columns=columns)
-                        answer.index += 1
 
                         seen = set()
                         orders = []
@@ -845,8 +855,7 @@ class OnMessageHandler:
                         if orders:
                             answer = answer.sort_values(by=orders, ascending=False)
 
-                        table = discord_markdown(answer.to_string().splitlines())
-                        await channel.send(f"{table}")
+                        await channel.send(f"{discord_markdown(answer)}")
                         return
                     elif option == 'graph':
                         career_buffer = query_presets.career_graph(arguments)
