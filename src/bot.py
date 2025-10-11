@@ -74,7 +74,6 @@ async def populate_dictionaries():
                      {'admin': 1,
                       'email needed': 2,
                       'game runner': 3,
-                      'admin': 4,
                       'poker bot': 4,
                       }
                  }
@@ -240,7 +239,8 @@ async def shutdown_message(file_path: Optional[str] = None):
 
 async def shutdown():
     logger.info("Shutting down bot, dumping database if not already done...")
-    dump_path = dump_database_once()
+    os.makedirs("db/backup", exist_ok=True)
+    dump_path = f"db/backup/dump_{timestamp}.sql"
     try:
         await shutdown_message(dump_path)
     except Exception as err:
@@ -249,7 +249,10 @@ async def shutdown():
     pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
     for task in pending:
         task.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
+    try:
+        await asyncio.gather(*pending, return_exceptions=True)
+    except asyncio.CancelledError as err:
+        logger.warning(f"Error during task cleanup: {err}")
 
     if not bot.is_closed():
         await bot.close()
@@ -535,3 +538,4 @@ async def on_message(message: discord.Message):
 
 def run_discord_bot():
     bot.run(os.getenv('DISCORD_BOT_TOKEN'), log_handler=None)
+
