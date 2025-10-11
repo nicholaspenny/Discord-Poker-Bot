@@ -27,14 +27,14 @@ def leaderboard(names = None, order_avg=False):
             WHERE p.name ILIKE ANY(%s)
             """
     leaderboard_query_end = f"""
-        ORDER BY {'avg_net_per_appearance' if order_avg else 'total_net'} desc
+        ORDER BY {'avg_net' if order_avg else 'total_net'} desc
         """
     leaderboard_query = f"""
         SELECT u.player_id,
             p.name,
-            COUNT(*) AS appearances,
+            COUNT(*) AS sessions,
             round(SUM(l.net/100.0),2) AS total_net,
-            ROUND(AVG(l.net/100.0), 2) AS avg_net_per_appearance
+            ROUND(AVG(l.net/100.0), 2) AS avg_net
         FROM ledgers l
         JOIN users u ON l.user_id = u.user_id
         JOIN players p ON u.player_id = p.player_id{leaderboard_query_mid}
@@ -52,19 +52,19 @@ def career(player_id: int):
         SELECT ledgers.alias,
             ROUND(ledgers.net / 100.0, 2) AS net,
             ROUND(SUM(ledgers.net / 100.0) OVER (ORDER BY games.date), 2) AS career,
-            TO_CHAR(games.date{tz_clause}, 'YYYY-MM-DD') AS date
+            TO_CHAR(games.date{tz_clause}, 'YYYY-MM-DD HH24:MI') AS date
         FROM ledgers
         JOIN users ON users.user_id = ledgers.user_id
         JOIN players ON players.player_id = users.player_id
         JOIN games ON ledgers.game_id = games.game_id
         WHERE players.player_id = %s
-        ORDER BY games.date
+        ORDER BY games.date DESC
         """
 
     with connect() as conn:
-        a, c = query(conn, career_query, player_id)
-
-    return a, c
+        answer, columns = query(conn, career_query, player_id)
+        narrowed = [(a[:13] + '...' if a and len(a) > 16 else a, n, c, d) for a, n, c, d in answer]
+    return narrowed, columns
 
 
 def grapher(grapher_query, title='', *args):
@@ -83,14 +83,19 @@ def grapher(grapher_query, title='', *args):
 
     if df.empty:
         return None
+
     game_counts = df['player_id'].value_counts()
     filtered_players = game_counts.head(14).index
     df_filtered = df[df['player_id'].isin(filtered_players)]
     wide = df_filtered.pivot(index="game_id", columns=["player_id", "name"], values="career").sort_index()
+    min_gid, max_gid = wide.index.min(), wide.index.max()
+    all_gids = sorted([gid for gid in date_map.index.to_list() if min_gid <= gid <= max_gid])
+    x0_gid = min_gid - 1
+    games = len(all_gids)
+
     wide.loc[wide.index[0] - 1] = 0
     wide = wide.sort_index()
     wide = wide.ffill().fillna(0)
-    games = len(wide) - 1
 
     num_lines = len(wide.columns)
     MAX_PLAYERS_PER_COL = 20
@@ -100,24 +105,25 @@ def grapher(grapher_query, title='', *args):
         count = df_filtered['player_id'].eq(player_id).sum()
         ax.plot(wide.index, wide[(player_id, name)], label=f'{name} - {count}')
 
-    game_ids = wide.index.to_list()
     MAX_TICKS = 15
-    step = (games + min(MAX_TICKS, games) - 1) // min(MAX_TICKS, games)
+    step = (games - 1 + MAX_TICKS - 1) //(MAX_TICKS - 1)
 
-    tick_positions = sorted(set(game_ids[::step] + [game_ids[-1]]))
+    ticks = [x0_gid] + all_gids
+    major_ticks = ticks[:-1:step] + [max_gid]
+    tick_date_map = [min_gid] + major_ticks[1:]
     tick_dates = [
         date_map['date'].get(gid).strftime("%Y-%m-%d") if gid in date_map.index else f'Game {gid}'
-        for gid in [game_ids[1]] + tick_positions[1:]
+        for gid in tick_date_map
     ]
 
-    ax.set_xticks(tick_positions)
+    ax.set_xticks(major_ticks)
     ax.set_xticklabels(tick_dates, rotation=90)
     ax.grid(True, axis='x', which='major', linestyle='--')
     ax.grid(True, axis='y', which='major', linestyle='--')
 
     previous_year = None
-    for game in wide.index:
-        date = date_map['date'].get(game)
+    for game in ticks:
+        date = date_map['date'].get(game if game != x0_gid else min_gid)
         if date and (previous_year is None or date.year > previous_year):
             ax.axvline(x=game, color='gray', linestyle='--', linewidth=1.5, zorder=0)
             ax.text(game, ax.get_ylim()[1] * 0.975 + ax.get_ylim()[0] * 0.025, str(date.year),
@@ -150,6 +156,8 @@ def grapher(grapher_query, title='', *args):
     return buffer
 
 def recent_graph(selected_players=None, days=30) -> io.BytesIO:
+    tz_clause = f" AT TIME ZONE '{timezone}'" if timezone else ''
+
     graph_query_mid = ''
     if selected_players:
         graph_query_mid = "WHERE name ILIKE ANY (%s)"
@@ -160,7 +168,7 @@ def recent_graph(selected_players=None, days=30) -> io.BytesIO:
             SELECT p.player_id AS player_id,
                    p.name AS name,
                    g.game_id AS game_id,
-                   g.date AS date,
+                   TO_CHAR(g.date{tz_clause}, 'YYYY-MM-DD HH24:MI') AS date,
                    SUM(l.net) / 100.0 AS ytd
             FROM games g
             JOIN ledgers l ON g.game_id = l.game_id
@@ -191,16 +199,19 @@ def recent_graph(selected_players=None, days=30) -> io.BytesIO:
 
 
 def career_graph(selected_players = None) -> io.BytesIO:
+    tz_clause = f" AT TIME ZONE '{timezone}'" if timezone else ''
+
     graph_query_mid = ''
     if selected_players:
         graph_query_mid = "WHERE name ILIKE ANY (%s)"
+
     graph_query_end = "ORDER BY player_id, game_id"
     graph_query = f"""
         WITH per_game AS (
             SELECT p.player_id as player_id,
                 p.name AS name,
                 g.game_id AS game_id,
-                g.date AS date,
+                TO_CHAR(g.date{tz_clause}, 'YYYY-MM-DD HH24:MI') AS date,
                 SUM(l.net) / 100.0 AS ytd
             FROM games g
             JOIN ledgers l ON g.game_id = l.game_id
@@ -221,4 +232,4 @@ def career_graph(selected_players = None) -> io.BytesIO:
         {graph_query_mid}
         {graph_query_end}
         """
-    return grapher(graph_query, f'Player Careers', *([selected_players] if selected_players else []))
+    return grapher(graph_query, f'Domain', *([selected_players] if selected_players else []))
