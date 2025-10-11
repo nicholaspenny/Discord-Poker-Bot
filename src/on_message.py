@@ -36,7 +36,7 @@ def keyword_search(text: str, keyword: str) -> str:
     return next((word for word in text.split() if keyword in word), '')
 
 
-def discord_markdown(df: pd.DataFrame, ratio=0.67, limit=2000, height=41) -> str:
+def discord_markdown(df: pd.DataFrame, ratio=0.67, height=41, limit=2000) -> str:
     if df is None or df.empty:
         return ""
 
@@ -47,13 +47,16 @@ def discord_markdown(df: pd.DataFrame, ratio=0.67, limit=2000, height=41) -> str
                 df['date'] = df['date'].dt.tz_convert(timezone)
             except Exception as err:
                 logging.warning(f"Invalid timezone '{timezone}', keeping UTC. Error: {err}")
-        df['date'] = df['date'].dt.strftime('%Y-%m-%d %H:%M %Z')
+        df['date'] = df['date'].dt.strftime('%Y-%m-%d %H:%M')
 
     if 'email' in df.columns:
         df['email'] = df['email'].apply(lambda x: x[:20] + '...' if x and len(x) > 23 else x)
 
     if 'alias' in df.columns:
         df['alias'] = df['alias'].apply(lambda x: x[:13] + '...' if x and len(x) > 16 else x)
+
+    if 'discord_id' in df.columns:
+        df['discord_id'] = df['discord_id'].apply(lambda x: str(int(x)) if not pd.isna(x) else '-')
 
     df = df.fillna('-')
     df.index += 1
@@ -67,7 +70,7 @@ def discord_markdown(df: pd.DataFrame, ratio=0.67, limit=2000, height=41) -> str
     if len(rows) > max_body:
         top_count = int(max_body * ratio)
         bottom_count = max_body - top_count - 1
-        output = rows[:top_count] + ["." * max_width] + rows[-bottom_count:]
+        output = rows[:top_count] + ["=" * max_width] + rows[-bottom_count:]
     else:
         output = rows
     content = "\n".join(header + output)
@@ -463,9 +466,9 @@ class OnMessageHandler:
                         return
                     finally:
                         await self.reset_sequences(guild)
-                elif option == 'table':
+                elif option == 'order':
                     if not arguments:
-                        await channel.send("!table requires 1 argument, the table name")
+                        await channel.send("!order requires 1 argument, the table name")
                         return
 
                     table = arguments[0].lower()
@@ -483,26 +486,26 @@ class OnMessageHandler:
                                 table
                             )
                             table_columns = [c[0].lower() for c in ans]
-                            table_query = f"""Select * FROM {safe_table} ORDER BY """
+                            order_query = f"""Select * FROM {safe_table} ORDER BY """
                             if arguments[1:]:
                                 for col in arguments[1:]:
                                     if col not in table_columns or not _IDENTIFIER_RE.fullmatch(col):
                                         await channel.send(f'Column: {col} - not in {table}')
                                         return
-                                table_query += ', '.join(f'"{col}" DESC' for col in arguments[1:])
+                                order_query += ', '.join(f'"{col}" DESC' for col in arguments[1:])
                             else:
-                                table_query += f'{lookup} DESC'
+                                order_query += f'{lookup} DESC'
 
-                            ans, cols = query(conn, table_query)
+                            ans, cols = query(conn, order_query)
                             answer = pd.DataFrame(ans, columns=cols)
-                            await channel.send(f"{discord_markdown(answer)}")
+                            await channel.send(f"{discord_markdown(answer, ratio=0.5)}")
                     except Exception as err:
-                        logger.exception('Unable to Connect to the Database: %s', err)
-                        await channel.send(f"Unable to Connect to the Database - {err}")
+                        logger.exception('Unable to Complete the Order Query: %s', err)
+                        await channel.send(f"Unable to Complete the Order Query - {err}")
                     return
-                elif option == 'search':
+                elif option == 'table':
                     if len(arguments) < 1:
-                        await channel.send("Usage: !search <table> <value> [value2] [value3] ...")
+                        await channel.send("Usage: !table <table> <value> [value2] [value3] ...")
                         return
 
                     table = arguments[0].lower()
@@ -557,8 +560,8 @@ class OnMessageHandler:
                             numeric_clause = " OR ".join((c for c in (equality_clause, inequality_clause) if c))
                             where_clause = " AND ".join((f'({c})' for c in (numeric_clause, string_clause) if c)) or "TRUE"
 
-                            search_query = f"SELECT * FROM {safe_table} WHERE {where_clause} {ordering}"
-                            ans2, cols = query(conn, search_query, *query_params)
+                            table_query = f"SELECT * FROM {safe_table} WHERE {where_clause} {ordering}"
+                            ans2, cols = query(conn, table_query, *query_params)
                             if not ans2:
                                 await channel.send(f'No matches found in {table}')
                                 return
@@ -566,11 +569,11 @@ class OnMessageHandler:
                             answer = pd.DataFrame(ans2, columns=cols)
                             await channel.send(f"{discord_markdown(answer)}")
                     except Exception as err:
-                        logger.exception('Unable to Complete the Search: %s', err)
-                        await channel.send(f"Unable to Complete the Search - {err}")
+                        logger.exception('Unable to Complete the Table Query: %s', err)
+                        await channel.send(f"Unable to Complete the Table Query - {err}")
                     return
 
-            await channel.send("!delete, !merge, !sequences, !table, !search, more commands soon")
+            await channel.send("!delete, !merge, !sequences, !order, !table, more commands soon")
             return
 
     @staticmethod
@@ -793,7 +796,7 @@ class OnMessageHandler:
                         ans, columns = query_presets.leaderboard(arguments, option == 'leaderboard_avg')
                         if ans:
                             answer = pd.DataFrame(ans, columns=columns)
-                            await channel.send(f"{discord_markdown(answer)}")
+                            await channel.send(f"{discord_markdown(answer, ratio=0.5)}")
                         else:
                             logger.info('Unexpected #query Error: %s', txt)
                             await channel.send("Unexpected Error")
@@ -821,7 +824,7 @@ class OnMessageHandler:
                             response = await self.prompt(
                                 channel,
                                 message.author,
-                                (f"Multiple Players Found. Make an Alphabetic Selection. Or 'Cancel'\n"
+                                (f"Multiple Players Found. Make an Alphabetical Selection. Or 'Cancel'\n"
                                  f"{name_list}\n"
                                  f"You have 1 minute.")
                             )
@@ -843,7 +846,7 @@ class OnMessageHandler:
                             await channel.send(f"No data found for {player_name}.")
                             return
 
-                        answer = pd.DataFrame(ans, columns=columns)
+                        answer = pd.DataFrame(reversed(ans), columns=columns)
 
                         seen = set()
                         orders = []
@@ -855,7 +858,7 @@ class OnMessageHandler:
                         if orders:
                             answer = answer.sort_values(by=orders, ascending=False)
 
-                        await channel.send(f"{discord_markdown(answer)}")
+                        await channel.send(f"{discord_markdown(answer, ratio=0.2)}")
                         return
                     elif option == 'graph':
                         career_buffer = query_presets.career_graph(arguments)
@@ -1183,4 +1186,3 @@ class OnMessageHandler:
             for user in new_users:
                 await self.admin_message(guild, f"{user} has been created")
             await self.admin_message(guild, f"!merge in <#{channels[guild.id]['database']}>")
-
