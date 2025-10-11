@@ -140,6 +140,7 @@ def dump_database() -> Optional[str]:
             "--section=data",
             "--section=post-data",
             "--blobs",
+            "--no-restrict",
             "--no-owner",
             DATABASE_URL,
             "-f",
@@ -538,4 +539,5 @@ async def on_message(message: discord.Message):
 
 def run_discord_bot():
     bot.run(os.getenv('DISCORD_BOT_TOKEN'), log_handler=None)
+
 
